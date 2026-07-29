@@ -47,6 +47,7 @@ pub fn load_token(handle: &str) -> Result<Option<String>> {
 
 /// Permanently forget one account's identity token (file + keyring).
 /// Does not affect other handles.
+#[allow(dead_code)]
 pub fn clear_token(handle: &str) -> Result<()> {
     if let Ok(entry) = Entry::new(SERVICE, handle) {
         let _ = entry.delete_credential();
@@ -83,6 +84,7 @@ fn fallback_path(handle: &str) -> Result<PathBuf> {
     Ok(data_dir()?.join("tokens").join(handle))
 }
 
+#[allow(dead_code)]
 pub fn using_fallback(handle: &str) -> bool {
     if let Ok(entry) = Entry::new(SERVICE, handle) {
         if entry.get_password().is_ok() {

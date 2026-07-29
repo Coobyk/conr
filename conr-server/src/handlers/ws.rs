@@ -10,12 +10,13 @@ use tokio::time::interval;
 
 use conr_shared::Event;
 
+use crate::db::is_blocked_either;
 use crate::error::ApiError;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
-    /// Access token (TUI clients pass via query; Authorization also works if set).
+    /// Access token via query (discouraged — prefer Authorization header).
     pub token: Option<String>,
 }
 
@@ -33,7 +34,7 @@ pub async fn ws_upgrade(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.strip_prefix("Bearer ").map(|t| t.to_string()))
         })
-        .ok_or_else(|| ApiError::unauthorized("missing token (query ?token= or Authorization)"))?;
+        .ok_or_else(|| ApiError::unauthorized("missing token (Authorization: Bearer or ?token=)"))?;
 
     let (user_id, handle) = state.signing_key.decode_access(&token)?;
     tracing::info!("ws        @{}  connected  id={}", handle, user_id);
@@ -57,18 +58,61 @@ async fn handle_socket(
             evt = rx.recv() => {
                 match evt {
                     Ok(event) => {
+                        if !event_visible_to(&state, &user_id, event.as_ref()).await {
+                            continue;
+                        }
                         let Ok(text) = serde_json::to_string(event.as_ref()) else { continue };
                         if sender.send(Message::Text(text.into())).await.is_err() {
                             break;
                         }
                         events_sent += 1;
-                        if let Event::NewPost { post } = event.as_ref() {
-                            tracing::debug!(
-                                "ws        @{}  ← NewPost from @{} ({})",
-                                handle,
-                                post.author_handle,
-                                post.id
-                            );
+                        match event.as_ref() {
+                            Event::NewPost { post } => {
+                                tracing::debug!(
+                                    "ws        @{}  ← NewPost from @{} ({})",
+                                    handle,
+                                    post.author_handle,
+                                    post.id
+                                );
+                            }
+                            Event::PostDeleted { post } => {
+                                tracing::debug!(
+                                    "ws        @{}  ← PostDeleted ({})",
+                                    handle,
+                                    post.id
+                                );
+                            }
+                            Event::PostEdited { post } => {
+                                tracing::debug!(
+                                    "ws        @{}  ← PostEdited ({})",
+                                    handle,
+                                    post.id
+                                );
+                            }
+                            Event::LikeUpdated { post_id, like_count } => {
+                                tracing::debug!(
+                                    "ws        @{}  ← LikeUpdated {} count={}",
+                                    handle,
+                                    post_id,
+                                    like_count
+                                );
+                            }
+                            Event::Notification { notification } => {
+                                tracing::debug!(
+                                    "ws        @{}  ← Notification kind={} from @{}",
+                                    handle,
+                                    notification.kind,
+                                    notification.actor_handle
+                                );
+                            }
+                            Event::DmMessage { message } => {
+                                tracing::debug!(
+                                    "ws        @{}  ← DmMessage conv={}",
+                                    handle,
+                                    message.conversation_id
+                                );
+                            }
+                            _ => {}
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -110,4 +154,48 @@ async fn handle_socket(
         user_id,
         events_sent
     );
+}
+
+/// Server-side fan-out filter: private events only to recipients; hide blocked authors.
+async fn event_visible_to(state: &AppState, user_id: &str, event: &Event) -> bool {
+    match event {
+        Event::Notification { notification } => notification.user_id == user_id,
+        Event::DmMessage { message } => {
+            is_dm_participant(state, user_id, &message.conversation_id).await
+        }
+        Event::NewPost { post } | Event::PostEdited { post } | Event::PostDeleted { post } => {
+            if post.author_id == user_id {
+                return true;
+            }
+            match is_blocked_either(&state.db, user_id, &post.author_id).await {
+                Ok(blocked) => !blocked,
+                Err(e) => {
+                    tracing::warn!(?e, "ws block check failed — dropping event");
+                    false
+                }
+            }
+        }
+        // Like counts are public engagement stats (no private content).
+        Event::LikeUpdated { .. } | Event::Pong | Event::Error { .. } => true,
+    }
+}
+
+async fn is_dm_participant(state: &AppState, user_id: &str, conv_id: &str) -> bool {
+    match sqlx::query_scalar::<_, bool>(
+        r#"SELECT EXISTS(
+            SELECT 1 FROM dm_participants
+            WHERE conversation_id = $1 AND user_id = $2
+        )"#,
+    )
+    .bind(conv_id)
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(ok) => ok,
+        Err(e) => {
+            tracing::warn!(?e, "ws dm participant check failed — dropping event");
+            false
+        }
+    }
 }

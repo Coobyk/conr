@@ -12,6 +12,9 @@ pub const TOKEN_LINES: usize = TOKEN_LEN / TOKEN_LINE_LEN; // 8
 pub const HANDLE_MIN: usize = 3;
 pub const HANDLE_MAX: usize = 32;
 pub const POST_MAX_LEN: usize = 512;
+pub const BIO_MAX_LEN: usize = 160;
+pub const BLOCK_REASON_MAX_LEN: usize = 280;
+pub const TAG_MAX_LEN: usize = 32;
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
@@ -21,6 +24,8 @@ pub enum ValidationError {
     InvalidToken,
     #[error("post content must be 1–{POST_MAX_LEN} characters after trim")]
     InvalidContent,
+    #[error("block reason must be 1–{BLOCK_REASON_MAX_LEN} characters after trim")]
+    InvalidBlockReason,
 }
 
 /// Normalize handle: trim, lowercase. Returns validated handle.
@@ -93,6 +98,86 @@ pub fn validate_content(raw: &str) -> Result<String, ValidationError> {
     Ok(content)
 }
 
+/// Extract unique lowercase hashtags (`#tag`) from content.
+pub fn extract_hashtags(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = content.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '#' {
+            continue;
+        }
+        let mut tag = String::new();
+        while let Some(&n) = chars.peek() {
+            if n.is_ascii_alphanumeric() || n == '_' {
+                tag.push(n);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if (1..=TAG_MAX_LEN).contains(&tag.len()) {
+            let t = tag.to_ascii_lowercase();
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// Extract unique lowercase @handles from content.
+pub fn extract_mentions(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = content.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '@' {
+            continue;
+        }
+        let mut handle = String::new();
+        while let Some(&n) = chars.peek() {
+            if n.is_ascii_alphanumeric() || n == '_' {
+                handle.push(n);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if (HANDLE_MIN..=HANDLE_MAX).contains(&handle.len()) {
+            let h = handle.to_ascii_lowercase();
+            if !out.contains(&h) {
+                out.push(h);
+            }
+        }
+    }
+    out
+}
+
+/// Validate optional bio (empty clears).
+pub fn validate_bio(raw: Option<&str>) -> Result<Option<String>, ValidationError> {
+    match raw {
+        None => Ok(None),
+        Some(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                Ok(None)
+            } else if t.chars().count() > BIO_MAX_LEN {
+                Err(ValidationError::InvalidContent)
+            } else {
+                Ok(Some(t.to_string()))
+            }
+        }
+    }
+}
+
+/// Block reason is required and non-empty after trim.
+pub fn validate_block_reason(raw: &str) -> Result<String, ValidationError> {
+    let t = raw.trim();
+    if t.is_empty() || t.chars().count() > BLOCK_REASON_MAX_LEN {
+        return Err(ValidationError::InvalidBlockReason);
+    }
+    Ok(t.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +206,21 @@ mod tests {
         assert!(validate_content("hi").is_ok());
         let long: String = "a".repeat(513);
         assert!(validate_content(&long).is_err());
+    }
+
+    #[test]
+    fn tags_and_mentions() {
+        let tags = extract_hashtags("hello #Rust and #conr #Rust");
+        assert_eq!(tags, vec!["rust", "conr"]);
+        let mentions = extract_mentions("hi @Alice and @bob_1");
+        assert_eq!(mentions, vec!["alice", "bob_1"]);
+    }
+
+    #[test]
+    fn block_reason_required() {
+        assert!(validate_block_reason("   ").is_err());
+        assert!(validate_block_reason("spam").is_ok());
+        let long: String = "x".repeat(BLOCK_REASON_MAX_LEN + 1);
+        assert!(validate_block_reason(&long).is_err());
     }
 }

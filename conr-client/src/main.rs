@@ -5,6 +5,7 @@ mod cache;
 mod clipboard;
 mod config;
 mod keychain;
+mod phase_c;
 mod reminders;
 mod ui;
 

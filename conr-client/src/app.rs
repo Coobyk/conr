@@ -1,8 +1,14 @@
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use conr_shared::{format_token_block, strip_token, validate_token, Event, Post, POST_MAX_LEN};
-use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyModifiers};
+use conr_shared::{
+    format_token_block, strip_token, validate_token, DmMessage, Event, Notification, Post,
+    POST_MAX_LEN,
+};
+use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -13,6 +19,9 @@ use crate::backup;
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::keychain;
+use crate::phase_c::{
+    DmListState, DmNewState, DmThreadState, FeedTab, NotifState, ProfileState, SearchState,
+};
 use crate::reminders::ReminderState;
 use crate::ui;
 
@@ -22,8 +31,24 @@ pub struct Session {
     pub user_id: String,
 }
 
+/// Open thread view state (kept while overlays like help/compose sit on top).
+#[derive(Debug, Clone)]
+pub struct ThreadState {
+    pub root_id: String,
+    pub posts: Vec<Post>,
+    pub selected: usize,
+}
+
+/// Where to return after leaving compose / confirm dialogs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnTo {
+    Feed,
+    Thread,
+}
+
 #[derive(Debug)]
 pub enum Screen {
+    #[allow(dead_code)]
     Boot,
     WelcomeMenu {
         /// Index into the combined menu: saved accounts first, then actions.
@@ -65,14 +90,54 @@ pub enum Screen {
         error: Option<String>,
     },
     Feed,
+    Thread,
     Compose {
         textarea: TextArea<'static>,
+        error: Option<String>,
+        parent_id: Option<String>,
+        /// When set, Ctrl+S PATCHes this post instead of creating.
+        edit_id: Option<String>,
+        return_to: ReturnTo,
+    },
+    ConfirmDelete {
+        post_id: String,
+        preview: String,
+        return_to: ReturnTo,
+    },
+    Search {
+        state: SearchState,
+    },
+    Profile {
+        state: ProfileState,
+    },
+    Notifications {
+        state: NotifState,
+    },
+    DmList {
+        state: DmListState,
+    },
+    DmNew {
+        state: DmNewState,
+    },
+    DmThread {
+        state: DmThreadState,
+    },
+    EditBio {
+        input: String,
+        error: Option<String>,
+    },
+    /// Confirm block with a required reason.
+    BlockUser {
+        handle: String,
+        reason: String,
         error: Option<String>,
     },
     Reminder {
         message: String,
     },
-    Help,
+    Help {
+        return_to: ReturnTo,
+    },
 }
 
 /// One row on the welcome menu.
@@ -86,29 +151,53 @@ pub enum MenuEntry {
 }
 
 pub struct App {
+    #[allow(dead_code)]
     pub config: Config,
     pub api: Api,
     pub screen: Screen,
     pub session: Option<Session>,
+    /// Global chronological feed (top-level posts).
     pub posts: Vec<Post>,
     pub selected: usize,
+    /// First visible post index in the feed viewport.
+    pub feed_scroll: usize,
+    /// Active thread (if any). Survives compose/help/delete overlays.
+    pub thread: Option<ThreadState>,
+    pub feed_tab: FeedTab,
+    pub unread_notifs: i64,
     pub status: String,
     pub ws_connected: bool,
     pub pending_token: Option<String>,
     /// Saved handles for the welcome picker (last-active first).
     pub saved_accounts: Vec<String>,
+    /// Handles the session user follows (live Following-tab filter).
+    pub following_handles: HashSet<String>,
+    /// Handles the session user blocked (live feed filter).
+    pub blocked_handles: HashSet<String>,
     cache: Cache,
     pub reminders: ReminderState,
     anim_started: Option<Instant>,
+    /// Sidebar ASCII logo wave (bold sweep) after returning home.
+    pub logo_wave_at: Option<Instant>,
+    /// App clock for ambient UI motion (live pulse, gradients).
+    pub ui_epoch: Instant,
     event_rx: Option<mpsc::UnboundedReceiver<ClientEvent>>,
     event_tx: mpsc::UnboundedSender<ClientEvent>,
     should_quit: bool,
+    /// Bumped to cancel in-flight WebSocket reconnect loops (logout / quit).
+    ws_generation: Arc<AtomicU64>,
+    quit_flag: Arc<AtomicBool>,
 }
 
 enum ClientEvent {
     WsConnected,
     WsDisconnected,
     NewPost(Post),
+    PostDeleted(Post),
+    PostEdited(Post),
+    LikeUpdated { post_id: String, like_count: i64 },
+    Notification(Notification),
+    DmMessage(DmMessage),
     Status(String),
 }
 
@@ -126,16 +215,26 @@ impl App {
             session: None,
             posts: cache.recent(50).unwrap_or_default(),
             selected: 0,
+            feed_scroll: 0,
+            thread: None,
+            feed_tab: FeedTab::All,
+            unread_notifs: 0,
             status: String::new(),
             ws_connected: false,
             pending_token: None,
             saved_accounts,
+            following_handles: HashSet::new(),
+            blocked_handles: HashSet::new(),
             cache,
             reminders,
             anim_started: None,
+            logo_wave_at: None,
+            ui_epoch: Instant::now(),
             event_rx: Some(event_rx),
             event_tx,
             should_quit: false,
+            ws_generation: Arc::new(AtomicU64::new(0)),
+            quit_flag: Arc::new(AtomicBool::new(false)),
         };
         // Silent auto-login only when exactly one saved account + auto_login on.
         // With multiple accounts, land on the picker (last-active preselected at top).
@@ -245,7 +344,13 @@ impl App {
                 break;
             }
 
-            if event::poll(Duration::from_millis(50))? {
+            // Smoother redraw while logo wave / ambient motion runs.
+            let tick = if self.ui_needs_fast_tick() {
+                Duration::from_millis(30)
+            } else {
+                Duration::from_millis(50)
+            };
+            if event::poll(tick)? {
                 match event::read()? {
                     CEvent::Key(key) => self.handle_key(key).await?,
                     CEvent::Paste(text) => self.handle_paste(&text).await?,
@@ -254,6 +359,22 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Seconds since UI clock started (ambient animation phase).
+    pub fn ui_secs(&self) -> f32 {
+        self.ui_epoch.elapsed().as_secs_f32()
+    }
+
+    fn ui_needs_fast_tick(&self) -> bool {
+        self.logo_wave_secs().is_some()
+            || matches!(
+                self.screen,
+                Screen::WelcomeAnim { .. }
+                    | Screen::WelcomeMenu { .. }
+                    | Screen::Login { .. }
+                    | Screen::Feed
+            )
     }
 
     fn handle_client_event(&mut self, ev: ClientEvent) {
@@ -267,12 +388,129 @@ impl App {
                 self.status = "reconnecting…".into();
             }
             ClientEvent::NewPost(post) => {
-                if !self.posts.iter().any(|p| p.id == post.id) {
+                let blocked = self.blocked_handles.contains(&post.author_handle);
+                let me = self.session.as_ref().map(|s| s.handle.as_str());
+                let on_following = self.feed_tab == FeedTab::Following;
+                let visible_on_tab = !on_following
+                    || me == Some(post.author_handle.as_str())
+                    || self.following_handles.contains(&post.author_handle);
+
+                // Feed only shows top-level posts that match the active tab / blocks.
+                if post.parent_id.is_none()
+                    && !blocked
+                    && visible_on_tab
+                    && !self.posts.iter().any(|p| p.id == post.id)
+                {
                     self.posts.insert(0, post.clone());
-                    let _ = self.cache.upsert_posts(std::slice::from_ref(&post));
+                    if !on_following {
+                        let _ = self.cache.upsert_posts(std::slice::from_ref(&post));
+                    }
+                } else if let Some(parent_id) = post.parent_id.as_ref() {
+                    if !blocked {
+                        if let Some(p) = self.posts.iter_mut().find(|p| p.id == *parent_id) {
+                            p.reply_count += 1;
+                        }
+                    }
+                }
+                // Append into open thread when the post belongs to it.
+                if !blocked {
+                    if let Some(th) = self.thread.as_mut() {
+                        let belongs = post.id == th.root_id
+                            || post
+                                .parent_id
+                                .as_ref()
+                                .map(|pid| posts_contains(&th.posts, pid))
+                                .unwrap_or(false);
+                        if belongs && !posts_contains(&th.posts, &post.id) {
+                            th.posts.push(post.clone());
+                            if let Some(pid) = post.parent_id.as_ref() {
+                                if let Some(p) = th.posts.iter_mut().find(|p| p.id == *pid) {
+                                    p.reply_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ClientEvent::PostDeleted(post) => {
+                Self::apply_deleted(&mut self.posts, &post);
+                let _ = self.cache.upsert_posts(std::slice::from_ref(&post));
+                if let Some(th) = self.thread.as_mut() {
+                    Self::apply_deleted(&mut th.posts, &post);
+                }
+            }
+            ClientEvent::PostEdited(post) => {
+                Self::apply_edited(&mut self.posts, &post);
+                let _ = self.cache.upsert_posts(std::slice::from_ref(&post));
+                if let Some(th) = self.thread.as_mut() {
+                    Self::apply_edited(&mut th.posts, &post);
+                }
+            }
+            ClientEvent::LikeUpdated {
+                post_id,
+                like_count,
+            } => {
+                Self::apply_like_count(&mut self.posts, &post_id, like_count);
+                if let Some(th) = self.thread.as_mut() {
+                    Self::apply_like_count(&mut th.posts, &post_id, like_count);
+                }
+            }
+            ClientEvent::Notification(n) => {
+                // Server already filters; still gate on session user_id.
+                if self
+                    .session
+                    .as_ref()
+                    .map(|s| s.user_id == n.user_id)
+                    .unwrap_or(false)
+                {
+                    self.unread_notifs = self.unread_notifs.saturating_add(1);
+                    self.status = format!("notif: {} from @{}", n.kind, n.actor_handle);
+                }
+            }
+            ClientEvent::DmMessage(msg) => {
+                // Server only delivers DMs for conversations we participate in.
+                let mine = self
+                    .session
+                    .as_ref()
+                    .map(|s| s.user_id == msg.sender_id)
+                    .unwrap_or(false);
+                if let Screen::DmThread { state } = &mut self.screen {
+                    let for_this = state.conversation_id == msg.conversation_id
+                        || (state.conversation_id.is_empty()
+                            && state.peer_handle == msg.sender_handle);
+                    if for_this && !state.messages.iter().any(|m| m.id == msg.id) {
+                        if state.conversation_id.is_empty() {
+                            state.conversation_id = msg.conversation_id.clone();
+                        }
+                        state.messages.push(msg.clone());
+                        state.scroll = state.messages.len().saturating_sub(1);
+                    }
+                }
+                if !mine && !matches!(self.screen, Screen::DmThread { .. }) {
+                    self.status = format!("✉ message from @{}", msg.sender_handle);
                 }
             }
             ClientEvent::Status(s) => self.status = s,
+        }
+    }
+
+    fn apply_edited(list: &mut [Post], post: &Post) {
+        if let Some(p) = list.iter_mut().find(|p| p.id == post.id) {
+            *p = post.clone();
+        }
+    }
+
+    pub(crate) fn apply_deleted(list: &mut [Post], post: &Post) {
+        if let Some(p) = list.iter_mut().find(|p| p.id == post.id) {
+            p.content = "[Deleted]".into();
+            p.deleted_at = post.deleted_at;
+        }
+    }
+
+    fn apply_like_count(list: &mut [Post], post_id: &str, like_count: i64) {
+        if let Some(p) = list.iter_mut().find(|p| p.id == post_id) {
+            p.like_count = like_count;
+            // Keep liked_by_me as-is (we may have set it ourselves).
         }
     }
 
@@ -307,10 +545,58 @@ impl App {
         Ok(())
     }
 
+    fn request_quit(&mut self) {
+        self.should_quit = true;
+        self.quit_flag.store(true, Ordering::SeqCst);
+        // Cancel any WS reconnect loops.
+        self.ws_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// True when letter keys should insert text, not trigger shortcuts.
+    fn is_typing_screen(&self) -> bool {
+        matches!(
+            &self.screen,
+            Screen::RegisterHandle { .. }
+                | Screen::UnlockConfirm { .. }
+                | Screen::BackupPassphrase { .. }
+                | Screen::Login { .. }
+                | Screen::Compose { .. }
+                | Screen::EditBio { .. }
+                | Screen::BlockUser { .. }
+                | Screen::DmNew { .. }
+                | Screen::DmThread { .. }
+                | Screen::Search {
+                    state: SearchState { editing: true, .. },
+                }
+        )
+    }
+
+    /// Letter from a key press, lowercased (Caps Lock / Shift-safe for shortcuts).
+    fn shortcut_letter(key: &KeyEvent) -> Option<char> {
+        match key.code {
+            KeyCode::Char(c) if c.is_ascii_alphabetic() => Some(c.to_ascii_lowercase()),
+            _ => None,
+        }
+    }
+
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
-        // global quit on ctrl+c
+        // Ignore key release/repeat (Ghostty / kitty keyboard protocol).
+        if key.kind != KeyEventKind::Press {
+            return Ok(());
+        }
+
+        // Always allow force-quit.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.should_quit = true;
+            self.request_quit();
+            return Ok(());
+        }
+
+        // Global quit on q/Q when not typing into a field.
+        if !self.is_typing_screen()
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && Self::shortcut_letter(&key) == Some('q')
+        {
+            self.request_quit();
             return Ok(());
         }
 
@@ -323,11 +609,23 @@ impl App {
             let entries = self.menu_entries();
             let n = entries.len().max(1);
             match key.code {
-                KeyCode::Char('j') | KeyCode::Down => {
+                KeyCode::Char(c)
+                    if matches!(c, 'j' | 'J') && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     selected = (selected + 1) % n;
                     self.screen = Screen::WelcomeMenu { selected };
                 }
-                KeyCode::Char('k') | KeyCode::Up => {
+                KeyCode::Down => {
+                    selected = (selected + 1) % n;
+                    self.screen = Screen::WelcomeMenu { selected };
+                }
+                KeyCode::Char(c)
+                    if matches!(c, 'k' | 'K') && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    selected = selected.checked_sub(1).unwrap_or(n - 1);
+                    self.screen = Screen::WelcomeMenu { selected };
+                }
+                KeyCode::Up => {
                     selected = selected.checked_sub(1).unwrap_or(n - 1);
                     self.screen = Screen::WelcomeMenu { selected };
                 }
@@ -355,15 +653,24 @@ impl App {
                                 error: None,
                             };
                         }
-                        Some(MenuEntry::Quit) | None => self.should_quit = true,
+                        Some(MenuEntry::Quit) | None => self.request_quit(),
                     }
                 }
-                KeyCode::Char('q') => self.should_quit = true,
                 _ => {
                     self.screen = Screen::WelcomeMenu { selected };
                 }
             }
             return Ok(());
+        }
+
+        // Phase C screens
+        if self.handle_phase_c_key(key).await? {
+            return Ok(());
+        }
+
+        // Thread view keys
+        if matches!(self.screen, Screen::Thread) {
+            return self.handle_thread_key(key).await;
         }
 
         match &mut self.screen {
@@ -422,9 +729,7 @@ impl App {
                 export_status,
                 flash,
             } => match key.code {
-                KeyCode::Char('c')
-                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     match crate::clipboard::export_token(token) {
                         Ok(status) => {
                             *export_status = status;
@@ -558,7 +863,11 @@ impl App {
                         *stage = 0;
                     } else {
                         let token = keychain::load_token(
-                            &self.session.as_ref().map(|s| s.handle.clone()).unwrap_or_default(),
+                            &self
+                                .session
+                                .as_ref()
+                                .map(|s| s.handle.clone())
+                                .unwrap_or_default(),
                         )?
                         .context("token missing from keychain")?;
                         backup::write_backup(&token, input)?;
@@ -619,19 +928,20 @@ impl App {
                 _ => {}
             },
             Screen::Feed => match key.code {
-                KeyCode::Char('q') => self.should_quit = true,
                 // Logout: stop silent auto-login, KEEP all identity tokens, show picker.
                 KeyCode::Char('L') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     let who = self.session.as_ref().map(|s| s.handle.clone());
                     self.session = None;
                     let _ = self.reminders.clear_session();
                     let _ = self.cache.clear();
-                    self.api.access_token = None;
-                    self.api.refresh_token = None;
+                    self.api.clear_tokens();
+                    self.following_handles.clear();
+                    self.blocked_handles.clear();
                     self.posts.clear();
                     self.ws_connected = false;
+                    // Stop old WebSocket loop so it stops spamming status after logout.
+                    self.ws_generation.fetch_add(1, Ordering::SeqCst);
                     self.refresh_saved_accounts();
-                    // Preselect the account we just left (still at top if present).
                     let sel = who
                         .as_ref()
                         .and_then(|h| self.saved_accounts.iter().position(|a| a == h))
@@ -643,39 +953,162 @@ impl App {
                         None => format!("logged out · {saved} account(s) saved"),
                     };
                 }
-                KeyCode::Char('j') | KeyCode::Down => {
+                KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Down => {
                     if !self.posts.is_empty() {
                         self.selected = (self.selected + 1).min(self.posts.len() - 1);
+                        self.ensure_feed_visible();
                     }
                 }
-                KeyCode::Char('k') | KeyCode::Up => {
+                KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Up => {
                     self.selected = self.selected.saturating_sub(1);
+                    self.ensure_feed_visible();
                 }
-                KeyCode::Char('g') => self.selected = 0,
-                KeyCode::Char('G') => {
+                KeyCode::Char('g') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.selected = 0;
+                    self.feed_scroll = 0;
+                }
+                KeyCode::Char('G') | KeyCode::Char('g')
+                    if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
                     if !self.posts.is_empty() {
                         self.selected = self.posts.len() - 1;
+                        self.ensure_feed_visible();
                     }
                 }
-                KeyCode::Char('n') => {
-                    let mut ta = TextArea::default();
-                    ta.set_placeholder_text("what's happening?");
-                    self.screen = Screen::Compose {
-                        textarea: ta,
-                        error: None,
-                    };
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.open_compose(None, ReturnTo::Feed);
                 }
-                KeyCode::Char('r') => {
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    if let Some(post) = self.posts.get(self.selected) {
+                        let id = post.id.clone();
+                        self.open_compose(Some(id), ReturnTo::Feed);
+                    }
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    if let Some(post) = self.posts.get(self.selected) {
+                        if self.is_mine(post) && post.deleted_at.is_none() {
+                            let id = post.id.clone();
+                            let content = post.content.clone();
+                            self.open_edit_post(&id, &content, ReturnTo::Feed);
+                        } else {
+                            self.status = "you can only edit your own posts".into();
+                        }
+                    }
+                }
+                KeyCode::Char('u') | KeyCode::Char('U') => {
                     if let Err(e) = self.refresh_feed().await {
                         self.status = format!("refresh failed: {e:#}");
                     }
                 }
-                KeyCode::Char('?') => self.screen = Screen::Help,
+                KeyCode::Tab => {
+                    self.feed_tab = self.feed_tab.toggle();
+                    if let Err(e) = self.refresh_feed().await {
+                        self.status = format!("refresh failed: {e:#}");
+                    } else {
+                        self.status = format!("tab: {}", self.feed_tab.label());
+                    }
+                }
+                KeyCode::Char('/') => {
+                    self.open_search().await;
+                }
+                KeyCode::Char('i') | KeyCode::Char('I') => {
+                    if let Err(e) = self.open_notifications().await {
+                        self.status = format!("notifications: {e:#}");
+                    }
+                }
+                KeyCode::Char('m') | KeyCode::Char('M') => {
+                    if let Err(e) = self.open_dm_list().await {
+                        self.status = format!("dms: {e:#}");
+                    }
+                }
+                // p = selected author's profile (what you want on the feed).
+                // Shift+p = your own profile (sidebar "Profile").
+                KeyCode::Char('p') | KeyCode::Char('P')
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    let mine = key.modifiers.contains(KeyModifiers::SHIFT);
+                    let handle = if mine {
+                        self.session.as_ref().map(|s| s.handle.clone())
+                    } else {
+                        self.posts
+                            .get(self.selected)
+                            .map(|p| p.author_handle.clone())
+                            .or_else(|| self.session.as_ref().map(|s| s.handle.clone()))
+                    };
+                    match handle {
+                        Some(h) => {
+                            if let Err(e) = self.open_profile(&h).await {
+                                self.status = format!("profile: {e:#}");
+                            }
+                        }
+                        None if mine => self.status = "not logged in".into(),
+                        None => self.status = "no post selected".into(),
+                    }
+                }
+                KeyCode::Char('f') | KeyCode::Char('F')
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    // follow author of selected post
+                    if let Some(post) = self.posts.get(self.selected) {
+                        let h = post.author_handle.clone();
+                        if self.session.as_ref().map(|s| s.handle == h).unwrap_or(false) {
+                            self.status = "that's you".into();
+                        } else {
+                            match self.api.follow(&h).await {
+                                Ok(_) => {
+                                    self.following_handles.insert(h.clone());
+                                    self.status = format!("followed @{h}");
+                                }
+                                Err(e) => self.status = format!("follow: {e:#}"),
+                            }
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(post) = self.posts.get(self.selected) {
+                        let id = post.id.clone();
+                        if let Err(e) = self.open_thread(&id).await {
+                            self.status = format!("thread failed: {e:#}");
+                        }
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(post) = self.posts.get(self.selected).cloned() {
+                        self.toggle_like_on(&post.id).await;
+                    }
+                }
+                KeyCode::Char('d') => {
+                    if let Some(post) = self.posts.get(self.selected) {
+                        if self.is_mine(post) && post.deleted_at.is_none() {
+                            let preview: String =
+                                post.display_content().chars().take(40).collect();
+                            self.screen = Screen::ConfirmDelete {
+                                post_id: post.id.clone(),
+                                preview,
+                                return_to: ReturnTo::Feed,
+                            };
+                        } else if !self.is_mine(post) {
+                            self.status = "you can only delete your own posts".into();
+                        }
+                    }
+                }
+                KeyCode::Char('?') => {
+                    self.screen = Screen::Help {
+                        return_to: ReturnTo::Feed,
+                    };
+                }
                 _ => {}
             },
-            Screen::Compose { textarea, error } => {
+            Screen::Compose {
+                textarea,
+                error,
+                parent_id,
+                edit_id,
+                return_to,
+            } => {
                 if key.code == KeyCode::Esc {
-                    self.screen = Screen::Feed;
+                    let ret = *return_to;
+                    self.return_from(ret);
                     return Ok(());
                 }
                 if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -689,42 +1122,397 @@ impl App {
                         *error = Some(format!("max {POST_MAX_LEN} characters"));
                         return Ok(());
                     }
-                    match self.api.create_post(trimmed).await {
-                        Ok(post) => {
-                            if !self.posts.iter().any(|p| p.id == post.id) {
-                                self.posts.insert(0, post.clone());
+                    let parent = parent_id.clone();
+                    let edit = edit_id.clone();
+                    let ret = *return_to;
+
+                    if let Some(eid) = edit {
+                        match self.api.edit_post(&eid, trimmed).await {
+                            Ok(post) => {
+                                Self::apply_edited(&mut self.posts, &post);
+                                let _ = self.cache.upsert_posts(std::slice::from_ref(&post));
+                                if let Some(th) = self.thread.as_mut() {
+                                    Self::apply_edited(&mut th.posts, &post);
+                                }
+                                self.status = "edited".into();
+                                self.return_from(ret);
                             }
-                            let _ = self.cache.upsert_posts(std::slice::from_ref(&post));
-                            self.selected = 0;
-                            self.screen = Screen::Feed;
-                            self.status = "posted".into();
+                            Err(e) => *error = Some(format!("{e:#}")),
+                        }
+                        return Ok(());
+                    }
+
+                    match self.api.create_post(trimmed, parent.as_deref()).await {
+                        Ok(post) => {
+                            if post.parent_id.is_none() {
+                                if !self.posts.iter().any(|p| p.id == post.id) {
+                                    self.posts.insert(0, post.clone());
+                                }
+                                let _ = self.cache.upsert_posts(std::slice::from_ref(&post));
+                                self.selected = 0;
+                            } else if let Some(ref pid) = post.parent_id {
+                                if let Some(p) = self.posts.iter_mut().find(|p| p.id == *pid) {
+                                    p.reply_count += 1;
+                                }
+                            }
+                            self.status = if parent.is_some() {
+                                "replied".into()
+                            } else {
+                                "posted".into()
+                            };
+                            match ret {
+                                ReturnTo::Thread => {
+                                    let root = self
+                                        .thread
+                                        .as_ref()
+                                        .map(|t| t.root_id.clone())
+                                        .or(parent.clone());
+                                    if let Some(rid) = root {
+                                        if let Err(e) = self.open_thread(&rid).await {
+                                            self.status =
+                                                format!("reply ok, thread refresh: {e:#}");
+                                            self.go_home();
+                                        }
+                                    } else {
+                                        self.go_home();
+                                    }
+                                }
+                                ReturnTo::Feed => {
+                                    if let Some(pid) = parent {
+                                        if let Err(e) = self.open_thread(&pid).await {
+                                            self.status =
+                                                format!("reply ok, open thread: {e:#}");
+                                            self.go_home();
+                                        }
+                                    } else {
+                                        self.go_home();
+                                    }
+                                }
+                            }
                         }
                         Err(e) => *error = Some(format!("{e:#}")),
                     }
                     return Ok(());
                 }
-                // forward to textarea
                 textarea.input(key);
             }
-            Screen::Help => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')) {
-                    self.screen = Screen::Feed;
+            Screen::ConfirmDelete {
+                post_id,
+                return_to,
+                ..
+            } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    let id = post_id.clone();
+                    let ret = *return_to;
+                    match self.api.delete_post(&id).await {
+                        Ok(post) => {
+                            Self::apply_deleted(&mut self.posts, &post);
+                            let _ = self.cache.upsert_posts(std::slice::from_ref(&post));
+                            self.status = "deleted".into();
+                            match ret {
+                                ReturnTo::Thread => {
+                                    if let Some(rid) =
+                                        self.thread.as_ref().map(|t| t.root_id.clone())
+                                    {
+                                        if let Err(e) = self.open_thread(&rid).await {
+                                            self.status = format!("deleted, thread: {e:#}");
+                                            self.go_home();
+                                        }
+                                    } else {
+                                        self.go_home();
+                                    }
+                                }
+                                ReturnTo::Feed => self.go_home(),
+                            }
+                        }
+                        Err(e) => {
+                            self.status = format!("delete failed: {e:#}");
+                            self.return_from(ret);
+                        }
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    let ret = *return_to;
+                    self.return_from(ret);
+                }
+                _ => {}
+            },
+            Screen::Help { return_to } => {
+                // q already handled as global quit; Esc / ? close help.
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
+                    let ret = *return_to;
+                    self.return_from(ret);
                 }
             }
             Screen::Reminder { .. } => {
-                if key.code == KeyCode::Enter {
+                // Must dismiss before other shortcuts work (q still quits globally).
+                if matches!(
+                    key.code,
+                    KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ')
+                ) {
                     let _ = self.reminders.acknowledge();
-                    self.screen = Screen::Feed;
+                    self.go_home();
                 }
             }
             Screen::WelcomeMenu { .. } => {} // handled above
+            Screen::Thread => {}             // handled above
+            Screen::Search { .. }
+            | Screen::Profile { .. }
+            | Screen::Notifications { .. }
+            | Screen::DmList { .. }
+            | Screen::DmNew { .. }
+            | Screen::DmThread { .. }
+            | Screen::EditBio { .. }
+            | Screen::BlockUser { .. } => {} // phase_c
             Screen::Boot => {}
         }
         Ok(())
     }
 
-    async fn enter_feed(&mut self) -> Result<()> {
+    /// Keep selected feed row roughly in view (approx 6 posts per screen).
+    fn ensure_feed_visible(&mut self) {
+        const WINDOW: usize = 5;
+        if self.selected < self.feed_scroll {
+            self.feed_scroll = self.selected;
+        } else if self.selected >= self.feed_scroll + WINDOW {
+            self.feed_scroll = self.selected.saturating_sub(WINDOW - 1);
+        }
+    }
+
+    async fn handle_thread_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Some(th) = self.thread.as_ref() else {
+            self.go_home();
+            return Ok(());
+        };
+        let root_id = th.root_id.clone();
+        let selected_post = th.posts.get(th.selected).cloned();
+
+        match key.code {
+            KeyCode::Esc => {
+                self.thread = None;
+                self.go_home();
+                self.status = "timeline".into();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(th) = self.thread.as_mut() {
+                    if !th.posts.is_empty() {
+                        th.selected = (th.selected + 1).min(th.posts.len() - 1);
+                    }
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(th) = self.thread.as_mut() {
+                    th.selected = th.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Char('g') => {
+                if let Some(th) = self.thread.as_mut() {
+                    th.selected = 0;
+                }
+            }
+            KeyCode::Char('G') => {
+                if let Some(th) = self.thread.as_mut() {
+                    if !th.posts.is_empty() {
+                        th.selected = th.posts.len() - 1;
+                    }
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(post) = selected_post {
+                    self.open_compose(Some(post.id), ReturnTo::Thread);
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Some(post) = selected_post {
+                    self.toggle_like_on(&post.id).await;
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(post) = selected_post {
+                    if self.is_mine(&post) && post.deleted_at.is_none() {
+                        let preview: String =
+                            post.display_content().chars().take(40).collect();
+                        self.screen = Screen::ConfirmDelete {
+                            post_id: post.id,
+                            preview,
+                            return_to: ReturnTo::Thread,
+                        };
+                    } else if !self.is_mine(&post) {
+                        self.status = "you can only delete your own posts".into();
+                    }
+                }
+            }
+            KeyCode::Char('u') => {
+                if let Err(e) = self.open_thread(&root_id).await {
+                    self.status = format!("refresh failed: {e:#}");
+                }
+            }
+            KeyCode::Char('?') => {
+                self.screen = Screen::Help {
+                    return_to: ReturnTo::Thread,
+                };
+            }
+            KeyCode::Char('n') => {
+                let parent = selected_post
+                    .as_ref()
+                    .map(|p| p.id.clone())
+                    .unwrap_or(root_id);
+                self.open_compose(Some(parent), ReturnTo::Thread);
+            }
+            KeyCode::Char('e') => {
+                if let Some(post) = selected_post {
+                    if self.is_mine(&post) && post.deleted_at.is_none() {
+                        self.open_edit_post(&post.id, &post.content, ReturnTo::Thread);
+                    } else {
+                        self.status = "you can only edit your own posts".into();
+                    }
+                }
+            }
+            KeyCode::Char('p') | KeyCode::Char('P')
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                // p → selected author; Shift+p → you
+                let mine = key.modifiers.contains(KeyModifiers::SHIFT);
+                let handle = if mine {
+                    self.session.as_ref().map(|s| s.handle.clone())
+                } else {
+                    selected_post
+                        .map(|p| p.author_handle)
+                        .or_else(|| self.session.as_ref().map(|s| s.handle.clone()))
+                };
+                match handle {
+                    Some(h) => {
+                        if let Err(e) = self.open_profile(&h).await {
+                            self.status = format!("profile: {e:#}");
+                        }
+                    }
+                    None => self.status = "no profile".into(),
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn open_compose(&mut self, parent_id: Option<String>, return_to: ReturnTo) {
+        let mut ta = TextArea::default();
+        if parent_id.is_some() {
+            ta.set_placeholder_text("post your reply");
+        } else {
+            ta.set_placeholder_text("what's happening?");
+        }
+        self.screen = Screen::Compose {
+            textarea: ta,
+            error: None,
+            parent_id,
+            edit_id: None,
+            return_to,
+        };
+    }
+
+    /// Navigate to the home feed and play the sidebar logo wave (if not already home).
+    pub fn go_home(&mut self) {
+        let was_home = matches!(self.screen, Screen::Feed);
         self.screen = Screen::Feed;
+        if !was_home {
+            self.play_logo_wave();
+        }
+    }
+
+    pub fn play_logo_wave(&mut self) {
+        self.logo_wave_at = Some(Instant::now());
+    }
+
+    /// Seconds into the logo wave, if still playing.
+    pub fn logo_wave_secs(&self) -> Option<f32> {
+        // One slow pass across the wordmark.
+        const WAVE_SECS: f32 = 2.8;
+        let t = self.logo_wave_at?.elapsed().as_secs_f32();
+        if t < WAVE_SECS {
+            Some(t)
+        } else {
+            None
+        }
+    }
+
+    fn return_from(&mut self, ret: ReturnTo) {
+        match ret {
+            ReturnTo::Feed => {
+                self.thread = None;
+                self.go_home();
+            }
+            ReturnTo::Thread => {
+                if self.thread.is_some() {
+                    self.screen = Screen::Thread;
+                } else {
+                    self.go_home();
+                }
+            }
+        }
+    }
+
+    fn is_mine(&self, post: &Post) -> bool {
+        self.session
+            .as_ref()
+            .map(|s| s.user_id == post.author_id)
+            .unwrap_or(false)
+    }
+
+    pub(crate) async fn toggle_like_on(&mut self, post_id: &str) {
+        match self.api.toggle_like(post_id).await {
+            Ok(resp) => {
+                Self::apply_like_full(
+                    &mut self.posts,
+                    &resp.post_id,
+                    resp.like_count,
+                    resp.liked_by_me,
+                );
+                if let Some(th) = self.thread.as_mut() {
+                    Self::apply_like_full(
+                        &mut th.posts,
+                        &resp.post_id,
+                        resp.like_count,
+                        resp.liked_by_me,
+                    );
+                }
+                self.status = if resp.liked_by_me {
+                    format!("liked · {}", resp.like_count)
+                } else {
+                    format!("unliked · {}", resp.like_count)
+                };
+            }
+            Err(e) => self.status = format!("like failed: {e:#}"),
+        }
+    }
+
+    fn apply_like_full(list: &mut [Post], post_id: &str, like_count: i64, liked_by_me: bool) {
+        if let Some(p) = list.iter_mut().find(|p| p.id == post_id) {
+            p.like_count = like_count;
+            p.liked_by_me = liked_by_me;
+        }
+    }
+
+    pub(crate) async fn open_thread(&mut self, post_id: &str) -> Result<()> {
+        let resp = self.api.get_thread(post_id).await?;
+        let ordered = order_thread_dfs(&resp.posts, &resp.root.id);
+        let selected = ordered
+            .iter()
+            .position(|p| p.id == post_id)
+            .unwrap_or(0);
+        self.thread = Some(ThreadState {
+            root_id: resp.root.id,
+            posts: ordered,
+            selected,
+        });
+        self.screen = Screen::Thread;
+        self.status = "thread".into();
+        Ok(())
+    }
+
+    async fn enter_feed(&mut self) -> Result<()> {
+        self.thread = None;
+        self.go_home();
+        self.play_logo_wave(); // always greet on login / enter
         if let Err(e) = self.refresh_feed().await {
             self.status = format!("using cache ({e:#})");
         }
@@ -737,12 +1525,36 @@ impl App {
         Ok(())
     }
 
-    async fn refresh_feed(&mut self) -> Result<()> {
-        let resp = self.api.feed(None).await?;
+    pub(crate) async fn refresh_feed(&mut self) -> Result<()> {
+        let following = self.feed_tab == FeedTab::Following;
+        let resp = self.api.feed(None, following).await?;
         self.posts = resp.posts;
-        let _ = self.cache.upsert_posts(&self.posts);
+        if !following {
+            let _ = self.cache.upsert_posts(&self.posts);
+        }
         self.selected = 0;
-        self.status = format!("{} posts", self.posts.len());
+        self.feed_scroll = 0;
+        self.status = format!(
+            "{} · {} posts",
+            self.feed_tab.label(),
+            self.posts.len()
+        );
+        // Keep social graph caches fresh for live filters.
+        let _ = self.refresh_social_sets().await;
+        // refresh unread badge
+        if let Ok(n) = self.api.notifications().await {
+            self.unread_notifs = n.unread;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn refresh_social_sets(&mut self) -> Result<()> {
+        if let Ok(handles) = self.api.list_following().await {
+            self.following_handles = handles.into_iter().collect();
+        }
+        if let Ok(handles) = self.api.list_blocks().await {
+            self.blocked_handles = handles.into_iter().collect();
+        }
         Ok(())
     }
 
@@ -750,19 +1562,90 @@ impl App {
         let Ok(url) = self.api.ws_url() else {
             return;
         };
+        // Invalidate any previous loop, then start a new generation.
+        let gen = self.ws_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let gen_flag = self.ws_generation.clone();
+        let quit_flag = self.quit_flag.clone();
+        let api = self.api.clone();
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             loop {
-                match tokio_tungstenite::connect_async(&url).await {
+                if quit_flag.load(Ordering::SeqCst) || gen_flag.load(Ordering::SeqCst) != gen {
+                    break;
+                }
+                // Prefer Authorization header (no token in URL / proxy logs).
+                let mut token = api.access_token();
+                if token.is_none() {
+                    let _ = api.refresh_session().await;
+                    token = api.access_token();
+                }
+                let Some(access) = token else {
+                    // Don't spam status after logout — just wait or exit if superseded.
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                };
+
+                let connect = async {
+                    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+                    use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+                    let mut req = url
+                        .as_str()
+                        .into_client_request()
+                        .map_err(|e| anyhow::anyhow!("ws request: {e}"))?;
+                    req.headers_mut().insert(
+                        AUTHORIZATION,
+                        format!("Bearer {access}")
+                            .parse()
+                            .map_err(|e| anyhow::anyhow!("ws auth header: {e}"))?,
+                    );
+                    tokio_tungstenite::connect_async(req)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                };
+
+                match connect.await {
                     Ok((ws, _)) => {
+                        if gen_flag.load(Ordering::SeqCst) != gen {
+                            break;
+                        }
                         let _ = tx.send(ClientEvent::WsConnected);
                         let (_write, mut read) = ws.split();
                         while let Some(msg) = read.next().await {
+                            if quit_flag.load(Ordering::SeqCst)
+                                || gen_flag.load(Ordering::SeqCst) != gen
+                            {
+                                break;
+                            }
                             match msg {
                                 Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                                     if let Ok(ev) = serde_json::from_str::<Event>(&text) {
-                                        if let Event::NewPost { post } = ev {
-                                            let _ = tx.send(ClientEvent::NewPost(post));
+                                        match ev {
+                                            Event::NewPost { post } => {
+                                                let _ = tx.send(ClientEvent::NewPost(post));
+                                            }
+                                            Event::PostDeleted { post } => {
+                                                let _ = tx.send(ClientEvent::PostDeleted(post));
+                                            }
+                                            Event::LikeUpdated {
+                                                post_id,
+                                                like_count,
+                                            } => {
+                                                let _ = tx.send(ClientEvent::LikeUpdated {
+                                                    post_id,
+                                                    like_count,
+                                                });
+                                            }
+                                            Event::PostEdited { post } => {
+                                                let _ = tx.send(ClientEvent::PostEdited(post));
+                                            }
+                                            Event::Notification { notification } => {
+                                                let _ = tx
+                                                    .send(ClientEvent::Notification(notification));
+                                            }
+                                            Event::DmMessage { message } => {
+                                                let _ = tx.send(ClientEvent::DmMessage(message));
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
@@ -774,13 +1657,81 @@ impl App {
                         let _ = tx.send(ClientEvent::WsDisconnected);
                     }
                     Err(e) => {
-                        let _ = tx.send(ClientEvent::Status(format!("ws error: {e}")));
+                        if gen_flag.load(Ordering::SeqCst) == gen
+                            && !quit_flag.load(Ordering::SeqCst)
+                        {
+                            let _ = api.refresh_session().await;
+                            let _ = tx.send(ClientEvent::Status(format!("ws error: {e}")));
+                        }
                     }
+                }
+                if quit_flag.load(Ordering::SeqCst) || gen_flag.load(Ordering::SeqCst) != gen {
+                    break;
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         });
     }
+}
+
+fn posts_contains(posts: &[Post], id: &str) -> bool {
+    posts.iter().any(|p| p.id == id)
+}
+
+/// DFS pre-order so replies nest under their parent in the TUI.
+pub fn order_thread_dfs(posts: &[Post], root_id: &str) -> Vec<Post> {
+    use std::collections::HashMap;
+    let mut children: HashMap<&str, Vec<&Post>> = HashMap::new();
+    for p in posts {
+        if let Some(ref parent) = p.parent_id {
+            children.entry(parent.as_str()).or_default().push(p);
+        }
+    }
+    for v in children.values_mut() {
+        v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    }
+
+    let mut out = Vec::with_capacity(posts.len());
+    fn walk<'a>(
+        id: &str,
+        posts: &'a [Post],
+        children: &std::collections::HashMap<&str, Vec<&'a Post>>,
+        out: &mut Vec<Post>,
+    ) {
+        if let Some(p) = posts.iter().find(|p| p.id == id) {
+            out.push(p.clone());
+            if let Some(kids) = children.get(id) {
+                for kid in kids {
+                    walk(&kid.id, posts, children, out);
+                }
+            }
+        }
+    }
+    walk(root_id, posts, &children, &mut out);
+    // Any orphans (shouldn't happen) append chronologically.
+    for p in posts {
+        if !out.iter().any(|o| o.id == p.id) {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
+/// Depth of a post within a thread list (0 = root).
+pub fn post_depth(posts: &[Post], post: &Post) -> usize {
+    let mut depth = 0;
+    let mut current_parent = post.parent_id.clone();
+    while let Some(pid) = current_parent {
+        depth += 1;
+        current_parent = posts
+            .iter()
+            .find(|p| p.id == pid)
+            .and_then(|p| p.parent_id.clone());
+        if depth > 64 {
+            break; // safety
+        }
+    }
+    depth
 }
 
 // silence unused

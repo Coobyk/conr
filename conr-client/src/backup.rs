@@ -52,6 +52,7 @@ pub fn write_backup(token: &str, passphrase: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn read_backup(passphrase: &str) -> Result<String> {
     let path = backup_path()?;
     let data = fs::read(&path).with_context(|| format!("read {}", path.display()))?;

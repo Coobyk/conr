@@ -7,22 +7,28 @@ use ratatui::Frame;
 use chrono::{DateTime, Utc};
 use conr_shared::{format_token_block, POST_MAX_LEN};
 
-use crate::app::{App, MenuEntry, Screen};
+use crate::app::{post_depth, App, MenuEntry, ReturnTo, Screen};
+use crate::phase_c::{FeedTab, SearchHit};
 
-// ── Palette (dark mode, purple accent) ──────────────────────────────────────
+// ── Palette (ink dark + violet) ─────────────────────────────────────────────
 
-const BG: Color = Color::Rgb(0x00, 0x00, 0x00);
-const SURFACE: Color = Color::Rgb(0x16, 0x18, 0x1c);
-const BORDER: Color = Color::Rgb(0x2f, 0x33, 0x36);
-const TEXT: Color = Color::Rgb(0xe7, 0xe9, 0xea);
-const MUTED: Color = Color::Rgb(0x71, 0x76, 0x7b);
-const PURPLE: Color = Color::Rgb(0x9b, 0x59, 0xf5);
-const LIKE: Color = Color::Rgb(0xf9, 0x18, 0x80);
-const RT: Color = Color::Rgb(0x00, 0xba, 0x7c);
-const ERR: Color = Color::Rgb(0xf4, 0x21, 0x2e);
-const OK: Color = Color::Rgb(0x00, 0xba, 0x7c);
-const SELECT_BG: Color = Color::Rgb(0x1a, 0x1a, 0x1a);
-const AVATAR_BG: Color = Color::Rgb(0x9b, 0x59, 0xf5);
+const BG: Color = Color::Rgb(0x0a, 0x0a, 0x0f);
+const SURFACE: Color = Color::Rgb(0x14, 0x14, 0x1c);
+const SURFACE2: Color = Color::Rgb(0x1c, 0x1c, 0x28);
+const BORDER: Color = Color::Rgb(0x2a, 0x2a, 0x3a);
+const TEXT: Color = Color::Rgb(0xf0, 0xee, 0xf6);
+const MUTED: Color = Color::Rgb(0x8a, 0x86, 0x9a);
+const PURPLE: Color = Color::Rgb(0xa7, 0x8b, 0xfa);
+const PURPLE_DIM: Color = Color::Rgb(0x5b, 0x45, 0x8f);
+const PURPLE_HOT: Color = Color::Rgb(0xc4, 0xb5, 0xfd);
+const LIKE: Color = Color::Rgb(0xf4, 0x72, 0xb6);
+const RT: Color = Color::Rgb(0x34, 0xd3, 0x99);
+const ERR: Color = Color::Rgb(0xf8, 0x71, 0x71);
+const OK: Color = Color::Rgb(0x34, 0xd3, 0x99);
+const SELECT_BG: Color = Color::Rgb(0x1e, 0x1b, 0x2e);
+const AVATAR_BG: Color = Color::Rgb(0xa7, 0x8b, 0xfa);
+const BUBBLE_ME: Color = Color::Rgb(0x2e, 0x22, 0x4a);
+const BUBBLE_THEM: Color = Color::Rgb(0x1a, 0x1a, 0x24);
 
 fn style_bg() -> Style {
     Style::default().bg(BG).fg(TEXT)
@@ -65,11 +71,140 @@ fn card_block(title: &str) -> Block<'static> {
         .padding(Padding::new(1, 1, 0, 0))
 }
 
+// ── Motion / color helpers ──────────────────────────────────────────────────
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let t = t.clamp(0.0, 1.0);
+    (a as f32 + (b as f32 - a as f32) * t).round() as u8
+}
+
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+            Color::Rgb(lerp_u8(ar, br, t), lerp_u8(ag, bg, t), lerp_u8(ab, bb, t))
+        }
+        _ => a,
+    }
+}
+
+/// Thin, dim hairline under headers (not a thick bright bar).
+fn gradient_hairline(width: usize, phase: f32) -> Line<'static> {
+    let w = width.max(1);
+    let mut spans = Vec::with_capacity(w);
+    for i in 0..w {
+        let base = i as f32 / w as f32;
+        let t = (base * 1.2 + phase * 0.04).rem_euclid(1.0);
+        let wave = (t * std::f32::consts::TAU).sin().abs();
+        // Stay near border / dim purple — never hot.
+        let c = lerp_color(BORDER, PURPLE_DIM, 0.25 + 0.35 * wave);
+        let ch = if i % 2 == 0 { "─" } else { " " };
+        spans.push(Span::styled(ch, Style::default().fg(c).bg(BG)));
+    }
+    Line::from(spans)
+}
+
+fn status_gradient_line(text: &str, phase: f32) -> Line<'static> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return Line::from("");
+    }
+    let n = chars.len().max(1) as f32;
+    let mut spans = Vec::with_capacity(chars.len());
+    for (i, ch) in chars.into_iter().enumerate() {
+        let t = (i as f32 / n + phase * 0.05).rem_euclid(1.0);
+        let c = lerp_color(MUTED, PURPLE, 0.08 + 0.18 * (t * std::f32::consts::TAU).sin().abs());
+        spans.push(Span::styled(
+            ch.to_string(),
+            Style::default().fg(c).bg(SURFACE2),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// density: 0.0 sparse … 1.0 party (welcome / login).
+fn draw_sparkle_field(frame: &mut Frame, area: Rect, phase: f32, density: f32) {
+    draw_sparkle_field_on(frame, area, phase, density, BG);
+}
+
+fn draw_sparkle_field_on(frame: &mut Frame, area: Rect, phase: f32, density: f32, bg: Color) {
+    if area.width < 6 || area.height < 3 {
+        return;
+    }
+    let density = density.clamp(0.05, 1.0);
+    let step = if density > 0.7 {
+        1usize
+    } else if density > 0.4 {
+        2
+    } else {
+        3
+    };
+    let threshold = (18.0 + density * 55.0) as u32;
+
+    for row in 0..area.height {
+        for col in (0..area.width).step_by(step) {
+            let n = ((col as u32).wrapping_mul(374761393)
+                ^ (row as u32).wrapping_mul(668265263)
+                ^ ((phase * 2.5) as u32).wrapping_mul(1274126177)
+                ^ ((phase as u32).wrapping_mul(97)))
+                % 1000;
+            if n > threshold {
+                continue;
+            }
+            let twinkle =
+                ((phase * 2.6 + col as f32 * 0.19 + row as f32 * 0.13).sin() + 1.0) * 0.5;
+            if twinkle < 0.28 {
+                continue;
+            }
+            let ch = match n % 5 {
+                0 => "✦",
+                1 => "·",
+                2 => "✧",
+                3 => "·",
+                _ => "⋆",
+            };
+            let c = lerp_color(PURPLE_DIM, PURPLE, 0.35 + 0.45 * twinkle);
+            let cell = Rect {
+                x: area.x + col,
+                y: area.y + row,
+                width: 1,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(ch, Style::default().fg(c).bg(bg))),
+                cell,
+            );
+        }
+    }
+}
+
+/// Instant popup shell (no intro animation). Returns content inner rect.
+fn begin_popup(frame: &mut Frame, base: Rect, title: &str) -> Rect {
+    frame.render_widget(Clear, base);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(PURPLE))
+        .title(Span::styled(format!(" {title} "), style_accent()))
+        .style(Style::default().bg(SURFACE).fg(TEXT))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(base);
+    frame.render_widget(block, base);
+    inner
+}
+
 // ── Entry ───────────────────────────────────────────────────────────────────
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     fill_bg(frame, area);
+
+    // Sparkles: login / welcome background only (sidebar sparkles drawn in draw_feed).
+    if matches!(
+        app.screen,
+        Screen::WelcomeMenu { .. } | Screen::Login { .. }
+    ) {
+        draw_sparkle_field(frame, area, app.ui_secs(), 0.95);
+    }
+
     match &app.screen {
         Screen::Boot => draw_centered(frame, area, "conr", "starting…"),
         Screen::WelcomeMenu { selected } => draw_welcome_menu(frame, area, app, *selected),
@@ -103,13 +238,54 @@ pub fn draw(frame: &mut Frame, app: &App) {
             error,
         } => draw_login(frame, area, handle, token_input, *focus, error.as_deref()),
         Screen::Feed => draw_feed(frame, area, app),
-        Screen::Compose { textarea, error } => {
-            draw_feed(frame, area, app);
-            draw_composer(frame, area, textarea, error.as_deref());
+        Screen::Thread => draw_thread(frame, area, app),
+        Screen::Compose {
+            textarea,
+            error,
+            parent_id,
+            edit_id,
+            return_to,
+        } => {
+            match return_to {
+                ReturnTo::Thread => draw_thread(frame, area, app),
+                ReturnTo::Feed => draw_feed(frame, area, app),
+            }
+            let mode = if edit_id.is_some() {
+                ComposeMode::Edit
+            } else if parent_id.is_some() {
+                ComposeMode::Reply
+            } else {
+                ComposeMode::New
+            };
+            draw_composer(frame, area, textarea, error.as_deref(), mode);
+        }
+        Screen::Search { state } => draw_search(frame, area, app, state),
+        Screen::Profile { state } => draw_profile(frame, area, app, state),
+        Screen::Notifications { state } => draw_notifications(frame, area, app, state),
+        Screen::DmList { state } => draw_dm_list(frame, area, app, state),
+        Screen::DmNew { state } => draw_dm_new(frame, area, app, state),
+        Screen::DmThread { state } => draw_dm_thread(frame, area, app, state),
+        Screen::EditBio { input, error } => draw_edit_bio(frame, area, input, error.as_deref()),
+        Screen::BlockUser {
+            handle,
+            reason,
+            error,
+        } => draw_block_user(frame, area, handle, reason, error.as_deref()),
+        Screen::ConfirmDelete {
+            preview, return_to, ..
+        } => {
+            match return_to {
+                ReturnTo::Thread => draw_thread(frame, area, app),
+                ReturnTo::Feed => draw_feed(frame, area, app),
+            }
+            draw_confirm_delete(frame, area, preview);
         }
         Screen::Reminder { message } => draw_reminder(frame, area, message),
-        Screen::Help => {
-            draw_feed(frame, area, app);
+        Screen::Help { return_to } => {
+            match return_to {
+                ReturnTo::Thread => draw_thread(frame, area, app),
+                ReturnTo::Feed => draw_feed(frame, area, app),
+            }
             draw_help(frame, area);
         }
     }
@@ -135,7 +311,7 @@ fn draw_centered(frame: &mut Frame, area: Rect, title: &str, subtitle: &str) {
 }
 
 fn draw_welcome_menu(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
-    let popup = centered_rect(56, 70, area);
+    let popup = begin_popup(frame, centered_rect(56, 70, area), "Welcome");
     let entries = app.menu_entries();
     let n_saved = app.saved_accounts.len();
     let last = app.reminders.handle.as_deref();
@@ -209,9 +385,10 @@ fn draw_welcome_menu(frame: &mut Frame, area: Rect, app: &App, selected: usize) 
         style_dim(),
     )));
 
-    let block = card_block("Welcome");
     frame.render_widget(
-        Paragraph::new(all).block(block).alignment(Alignment::Left),
+        Paragraph::new(all)
+            .alignment(Alignment::Left)
+            .style(Style::default().bg(SURFACE).fg(TEXT)),
         popup,
     );
 }
@@ -502,39 +679,43 @@ fn draw_login(
     frame.render_widget(Paragraph::new(lines).block(card_block("Log in")), popup);
 }
 
-// ── Main feed (Twitter-style chrome) ────────────────────────────────────────
+// ── Main chrome ─────────────────────────────────────────────────────────────
 
-fn draw_feed(frame: &mut Frame, area: Rect, app: &App) {
-    // Three-column layout: nav | timeline | right rail (when wide enough)
-    let wide = area.width >= 100;
-    let mid = if wide {
-        Layout::default()
+fn shell_columns(area: Rect) -> (Rect, Rect, Option<Rect>) {
+    let wide = area.width >= 110;
+    if wide {
+        let mid = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Length(22),
-                Constraint::Min(40),
-                Constraint::Length(28),
+                Constraint::Min(42),
+                Constraint::Length(30),
             ])
-            .split(area)
+            .split(area);
+        (mid[0], mid[1], Some(mid[2]))
     } else {
-        Layout::default()
+        let mid = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(18), Constraint::Min(30)])
-            .split(area)
-    };
-
-    draw_sidebar(frame, mid[0], app);
-    draw_timeline(frame, mid[1], app);
-    if wide {
-        draw_right_rail(frame, mid[2], app);
+            .constraints([Constraint::Length(20), Constraint::Min(30)])
+            .split(area);
+        (mid[0], mid[1], None)
     }
 }
 
-fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_feed(frame: &mut Frame, area: Rect, app: &App) {
+    let (side, main, rail) = shell_columns(area);
+    draw_sidebar(frame, side, app, "home");
+    draw_timeline(frame, main, app);
+    if let Some(r) = rail {
+        draw_right_rail(frame, r, app);
+    }
+}
+
+fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App, active: &str) {
     let block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Style::default().fg(BORDER))
-        .style(style_bg());
+        .style(Style::default().bg(SURFACE).fg(TEXT));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -544,38 +725,51 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         .map(|s| format!("@{}", s.handle))
         .unwrap_or_else(|| "@—".into());
 
-    // Unicode symbols only (no emoji presentation).
-    let nav = [
-        ("  ◆", true, false),
-        ("", false, false),
-        ("  ⌂  Home", true, true),
-        ("  ⌕  Explore", false, false),
-        ("  ◉  Notifications", false, false),
-        ("  ▤  Messages", false, false),
-        ("  ★  Bookmarks", false, false),
-        ("  ○  Profile", false, false),
-        ("  ··· More", false, false),
-        ("", false, false),
-        ("  +  Post", true, false),
-    ];
+    let notif = if app.unread_notifs > 0 {
+        format!("  Notifs  {}", app.unread_notifs)
+    } else {
+        "  Notifs".into()
+    };
 
-    let mut lines: Vec<Line> = Vec::new();
-    for (label, active, selected) in nav {
-        if label.is_empty() {
-            lines.push(Line::from(""));
-            continue;
-        }
+    let items: [(&str, &str); 6] = [
+        ("home", "  Home"),
+        ("search", "  Search"),
+        ("notifs", &notif),
+        ("messages", "  Messages"),
+        ("profile", "  Profile"),
+        ("post", "  Post"),
+    ];
+    // Profile = Shift+p (your page). Plain p opens the selected author.
+    let keys = ["", "/", "i", "m", "P", "n"];
+
+    // ASCII "conr" wordmark — bold wave when returning home.
+    let mut lines: Vec<Line> = conr_logo_lines(app.logo_wave_secs());
+    lines.push(Line::from(Span::styled("  ╶─────────────╴", style_dim())));
+
+    for (i, (id, label)) in items.iter().enumerate() {
+        let selected = *id == active;
+        let key = keys[i];
+        let row = if key.is_empty() {
+            (*label).to_string()
+        } else {
+            format!("{label:<12} {key}")
+        };
         let style = if selected {
             Style::default()
                 .fg(TEXT)
                 .bg(SELECT_BG)
                 .add_modifier(Modifier::BOLD)
-        } else if active {
-            style_bold()
         } else {
-            style_dim()
+            Style::default().fg(TEXT).bg(SURFACE)
         };
-        lines.push(Line::from(Span::styled(label, style)));
+        let pulse = ((app.ui_secs() * 2.8).sin() + 1.0) * 0.5;
+        let marker = if selected {
+            let c = lerp_color(PURPLE, PURPLE_HOT, pulse);
+            Span::styled("▌", Style::default().fg(c).bg(SELECT_BG))
+        } else {
+            Span::styled(" ", Style::default().bg(SURFACE))
+        };
+        lines.push(Line::from(vec![marker, Span::styled(row, style)]));
     }
 
     lines.push(Line::from(""));
@@ -583,23 +777,157 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         format!("  {handle}"),
         style_accent(),
     )));
-
-    let conn = if app.ws_connected {
-        ("  * Live", style_ok())
+    // Breathing live indicator.
+    let live_line = if app.ws_connected {
+        let pulse = ((app.ui_secs() * 2.4).sin() + 1.0) * 0.5;
+        let c = lerp_color(OK, PURPLE_HOT, pulse * 0.55);
+        Line::from(vec![
+            Span::styled("  ● ", Style::default().fg(c)),
+            Span::styled("live", Style::default().fg(c).add_modifier(Modifier::BOLD)),
+        ])
     } else {
-        ("  o Offline", style_dim())
+        Line::from(Span::styled("  ○ offline", style_dim()))
     };
-    lines.push(Line::from(Span::styled(conn.0, conn.1)));
-
-    // Bottom key hints squeezed into sidebar when short
+    lines.push(live_line);
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("  n post  r refresh", style_dim())));
-    lines.push(Line::from(Span::styled("  j/k  ?  q", style_dim())));
+    lines.push(Line::from(Span::styled("  Tab feed mode", style_dim())));
+    lines.push(Line::from(Span::styled("  ? help · q quit", style_dim())));
 
+    let content_rows = lines.len() as u16;
     frame.render_widget(Paragraph::new(lines), inner);
+
+    // Sparkles only on home sidebar, in the free space under the nav.
+    if active == "home" && inner.height > content_rows + 1 {
+        let sparkle = Rect {
+            x: inner.x,
+            y: inner.y + content_rows,
+            width: inner.width,
+            height: inner.height - content_rows,
+        };
+        draw_sparkle_field_on(frame, sparkle, app.ui_secs(), 0.75, SURFACE);
+    }
+}
+
+/// Big sidebar wordmark. Default is bold; one slow crest un-bolds as it passes.
+fn conr_logo_lines(wave_t: Option<f32>) -> Vec<Line<'static>> {
+    const LOGO: [&str; 4] = [
+        "╔══╗╔══╗╔══╗╔═╗",
+        "║╔═╝║╔╗║║╔╗║║╔╝",
+        "║╚═╗║╚╝║║║║║║║ ",
+        "╚══╝╚══╝╚╝╚╝╚╝ ",
+    ];
+
+    LOGO.iter()
+        .enumerate()
+        .map(|(row, text)| {
+            let mut spans: Vec<Span> = vec![Span::raw("  ")];
+            for (i, ch) in text.chars().enumerate() {
+                let style = logo_char_style(wave_t, row, i);
+                spans.push(Span::styled(ch.to_string(), style));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn logo_char_style(wave_t: Option<f32>, row: usize, col: usize) -> Style {
+    // Resting look: bold purple.
+    let bold_accent = Style::default().fg(PURPLE).add_modifier(Modifier::BOLD);
+    let Some(t) = wave_t else {
+        return bold_accent;
+    };
+
+    // Single slow crest, left → right. Wave *removes* bold so it's visible
+    // against the bold default.
+    const WAVE_SECS: f32 = 2.8;
+    const LOGO_COLS: f32 = 15.0;
+    // Long soft band (~half the wordmark).
+    const CREST_HALF: f32 = 5.5;
+
+    let x = col as f32 + row as f32 * 0.25;
+    let peak = -CREST_HALF + (t / WAVE_SECS) * (LOGO_COLS + CREST_HALF * 2.0);
+    let dist = (x - peak).abs();
+    let u = (dist / CREST_HALF).clamp(0.0, 1.0);
+    // 1.0 at center of wave, 0.0 outside.
+    let intensity = (1.0 - u) * (1.0 - u);
+
+    if intensity > 0.35 {
+        // Crest — regular weight + slightly dimmer so the unbold reads clearly.
+        Style::default().fg(PURPLE_DIM)
+    } else if intensity > 0.08 {
+        // Soft edge — regular weight, full purple.
+        Style::default().fg(PURPLE)
+    } else {
+        // Outside the wave — stay bold.
+        bold_accent
+    }
 }
 
 fn draw_timeline(frame: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let header_block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(BORDER))
+        .style(style_bg());
+    let header_inner = header_block.inner(chunks[0]);
+    frame.render_widget(header_block, chunks[0]);
+
+    let phase = app.ui_secs();
+    let (you_style, fol_style) = match app.feed_tab {
+        FeedTab::All => (
+            Style::default().fg(PURPLE_HOT).add_modifier(Modifier::BOLD),
+            style_dim(),
+        ),
+        FeedTab::Following => (
+            style_dim(),
+            Style::default().fg(PURPLE_HOT).add_modifier(Modifier::BOLD),
+        ),
+    };
+    let header_lines = vec![
+        Line::from(Span::styled("  Home", style_bold())),
+        Line::from(vec![
+            Span::styled("  For you", you_style),
+            Span::styled("   ·   ", style_dim()),
+            Span::styled("Following", fol_style),
+            Span::styled("            Tab switch", style_dim()),
+        ]),
+        gradient_hairline(header_inner.width as usize, phase),
+    ];
+    frame.render_widget(Paragraph::new(header_lines), header_inner);
+
+    let feed_inner = chunks[1];
+    let lines = build_feed_lines(app, feed_inner.width as usize);
+    frame.render_widget(Paragraph::new(lines).style(style_bg()), feed_inner);
+
+    let status = if app.status.is_empty() {
+        "  j/k scroll · n post · r reply · ␣ like · ⏎ thread · m messages · / search · ?"
+            .to_string()
+    } else {
+        format!("  {}", app.status)
+    };
+    frame.render_widget(
+        Paragraph::new(status_gradient_line(&status, phase))
+            .style(Style::default().bg(SURFACE2)),
+        chunks[2],
+    );
+}
+
+// ── Thread view ─────────────────────────────────────────────────────────────
+
+fn draw_thread(frame: &mut Frame, area: Rect, app: &App) {
+    let (root_id, posts, selected) = match &app.thread {
+        Some(th) => (th.root_id.as_str(), th.posts.as_slice(), th.selected),
+        None => ("", &[][..], 0),
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -609,7 +937,6 @@ fn draw_timeline(frame: &mut Frame, area: Rect, app: &App) {
         ])
         .split(area);
 
-    // Header: Home + underline tab
     let header_block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(BORDER))
@@ -617,74 +944,75 @@ fn draw_timeline(frame: &mut Frame, area: Rect, app: &App) {
     let header_inner = header_block.inner(chunks[0]);
     frame.render_widget(header_block, chunks[0]);
 
+    let root_handle = posts
+        .iter()
+        .find(|p| p.id == root_id)
+        .map(|p| format!("@{}", p.author_handle))
+        .unwrap_or_else(|| "thread".into());
     let header_lines = vec![
-        Line::from(Span::styled("  Home", style_bold())),
-        Line::from(vec![
-            Span::styled("  For you", style_accent()),
-            Span::styled("          Following", style_dim()),
-        ]),
+        Line::from(Span::styled(
+            format!("  Thread · {root_handle}"),
+            style_bold(),
+        )),
+        Line::from(Span::styled(
+            format!("  {} post(s)  ·  Esc back", posts.len()),
+            style_dim(),
+        )),
     ];
     frame.render_widget(Paragraph::new(header_lines), header_inner);
 
-    // Tweet list
-    let feed_block = Block::default().style(style_bg());
-    let feed_inner = feed_block.inner(chunks[1]);
-    frame.render_widget(feed_block, chunks[1]);
+    let feed_inner = chunks[1];
+    let lines = build_thread_lines(posts, selected, feed_inner.width as usize);
+    frame.render_widget(Paragraph::new(lines).style(style_bg()), feed_inner);
 
-    let lines = build_feed_lines(app, feed_inner.width as usize);
-    frame.render_widget(Paragraph::new(lines), feed_inner);
-
-    // Status strip
     let status = if app.status.is_empty() {
-        "  j/k scroll  ·  n What's happening?  ·  r refresh  ·  ? help  ·  q quit".to_string()
+        "  j/k  ·  r reply  ·  ␣ like  ·  d delete  ·  u refresh  ·  Esc back".to_string()
     } else {
         format!("  {}", app.status)
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(status, style_dim())))
-            .style(Style::default().bg(SURFACE).fg(MUTED)),
+        Paragraph::new(status_gradient_line(&status, app.ui_secs()))
+            .style(Style::default().bg(SURFACE2)),
         chunks[2],
     );
 }
 
-fn build_feed_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+fn build_thread_lines(
+    posts: &[conr_shared::Post],
+    selected: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let content_width = width.saturating_sub(6).max(20);
-
-    if app.posts.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Welcome to your timeline",
-            style_bold(),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  When people post, they'll show up here.",
-            style_dim(),
-        )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  Press n to post what's happening.",
-            Style::default().fg(PURPLE),
-        )));
+    if posts.is_empty() {
+        lines.push(Line::from(Span::styled("  (empty thread)", style_dim())));
         return lines;
     }
 
-    for (i, p) in app.posts.iter().enumerate() {
-        let selected = i == app.selected;
-        let row_bg = if selected { SELECT_BG } else { BG };
+    for (i, p) in posts.iter().enumerate() {
+        let depth = post_depth(posts, p);
+        let indent = "  ".repeat(depth.min(12));
+        let selected_row = i == selected;
+        let row_bg = if selected_row { SELECT_BG } else { BG };
+        let content_width = width.saturating_sub(4 + indent.chars().count() * 2).max(12);
 
-        // Divider
         lines.push(Line::from(Span::styled(
-            "─".repeat(width.min(200)),
+            format!(
+                "{indent}{}",
+                "─".repeat(width.saturating_sub(indent.len()).min(120))
+            ),
             Style::default().fg(BORDER).bg(row_bg),
         )));
 
-        // Header: avatar + @handle · time
         let avatar = avatar_glyph(&p.author_handle);
         let time = relative_time(p.created_at);
         let handle = p.author_handle.clone();
+        let marker = if depth == 0 { " " } else { "↳" };
 
         lines.push(Line::from(vec![
+            Span::styled(
+                format!("{indent}{marker}"),
+                Style::default().fg(MUTED).bg(row_bg),
+            ),
             Span::styled(
                 format!(" {avatar} "),
                 Style::default()
@@ -702,36 +1030,175 @@ fn build_feed_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             Span::styled(format!(" · {time}"), Style::default().fg(MUTED).bg(row_bg)),
         ]));
 
-        // Body (wrapped)
-        for wrap_line in wrap_text(&p.content, content_width) {
+        let body = p.display_content();
+        let body_style = if p.deleted_at.is_some() {
+            Style::default()
+                .fg(MUTED)
+                .bg(row_bg)
+                .add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default().fg(TEXT).bg(row_bg)
+        };
+        for wrap_line in wrap_text(body, content_width) {
             lines.push(Line::from(Span::styled(
-                format!("    {wrap_line}"),
-                Style::default().fg(TEXT).bg(row_bg),
+                format!("{indent}    {wrap_line}"),
+                body_style,
             )));
         }
 
-        // Action row (visual only — Phase A has no likes/replies)
+        let like_label = if p.liked_by_me {
+            format!("♥ {}", p.like_count)
+        } else {
+            format!("♡ {}", p.like_count)
+        };
+        let like_style = if p.liked_by_me {
+            Style::default().fg(LIKE).bg(row_bg)
+        } else {
+            Style::default().fg(MUTED).bg(row_bg)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{indent}    ↩ {}  ", p.reply_count),
+                Style::default().fg(MUTED).bg(row_bg),
+            ),
+            Span::styled(like_label, like_style),
+            if selected_row {
+                Span::styled("  · selected", Style::default().fg(PURPLE).bg(row_bg))
+            } else {
+                Span::styled("", Style::default().bg(row_bg))
+            },
+        ]));
+        lines.push(Line::from(Span::styled(" ", Style::default().bg(row_bg))));
+    }
+    lines
+}
+
+fn build_feed_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let content_width = width.saturating_sub(6).max(20);
+
+    if app.posts.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Your timeline is empty",
+            style_bold(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Posts from everyone (or people you follow) land here.",
+            style_dim(),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  n  write a post",
+            Style::default().fg(PURPLE),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  /  find people  ·  Tab  following only",
+            style_dim(),
+        )));
+        return lines;
+    }
+
+    let phase = app.ui_secs();
+    let sel_pulse = ((phase * 2.6).sin() + 1.0) * 0.5;
+    let sel_bar = lerp_color(PURPLE, PURPLE_HOT, sel_pulse);
+
+    let start = app.feed_scroll.min(app.posts.len().saturating_sub(1));
+    for (i, p) in app.posts.iter().enumerate().skip(start) {
+        let selected = i == app.selected;
+        let row_bg = if selected { SELECT_BG } else { BG };
+        let gutter = if selected { "▌" } else { " " };
+        let gutter_style = if selected {
+            Style::default().fg(sel_bar).bg(row_bg)
+        } else {
+            Style::default().fg(BORDER).bg(row_bg)
+        };
+
+        // Divider
+        lines.push(Line::from(vec![
+            Span::styled(gutter, gutter_style),
+            Span::styled(
+                "─".repeat(width.saturating_sub(1).min(199)),
+                Style::default().fg(BORDER).bg(row_bg),
+            ),
+        ]));
+
+        // Header: avatar + @handle · time
+        let avatar = avatar_glyph(&p.author_handle);
+        let time = relative_time(p.created_at);
+        let handle = p.author_handle.clone();
+
+        lines.push(Line::from(vec![
+            Span::styled(gutter, gutter_style),
+            Span::styled(
+                format!(" {avatar} "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(AVATAR_BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" @{handle}"),
+                Style::default()
+                    .fg(TEXT)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" · {time}"), Style::default().fg(MUTED).bg(row_bg)),
+            if p.edited_at.is_some() {
+                Span::styled(" · edited", Style::default().fg(MUTED).bg(row_bg))
+            } else {
+                Span::styled("", Style::default().bg(row_bg))
+            },
+        ]));
+
+        // Body (wrapped); tombstones render as [Deleted]
+        let body = p.display_content();
+        let body_style = if p.deleted_at.is_some() {
+            Style::default()
+                .fg(MUTED)
+                .bg(row_bg)
+                .add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default().fg(TEXT).bg(row_bg)
+        };
+        for wrap_line in wrap_text(body, content_width) {
+            lines.push(Line::from(vec![
+                Span::styled(gutter, gutter_style),
+                Span::styled(format!("   {wrap_line}"), body_style),
+            ]));
+        }
+
+        // Action row with live counts
         let action_style = Style::default().fg(MUTED).bg(row_bg);
+        let like_label = if p.liked_by_me {
+            format!("♥ {}", p.like_count)
+        } else {
+            format!("♡ {}", p.like_count)
+        };
+        let like_style = if p.liked_by_me || selected {
+            Style::default().fg(LIKE).bg(row_bg)
+        } else {
+            action_style
+        };
         let sel_hint = if selected {
-            Span::styled("  · selected", Style::default().fg(PURPLE).bg(row_bg))
+            Span::styled(
+                "  · selected",
+                Style::default().fg(sel_bar).bg(row_bg),
+            )
         } else {
             Span::styled("", Style::default().bg(row_bg))
         };
         lines.push(Line::from(vec![
-            Span::styled("    ↩     ", action_style),
+            Span::styled(gutter, gutter_style),
+            Span::styled(format!("   ↩ {}   ", p.reply_count), action_style),
+            Span::styled(format!("{like_label}   "), like_style),
             Span::styled(
-                "↻     ",
+                "↗",
                 Style::default()
                     .fg(if selected { RT } else { MUTED })
                     .bg(row_bg),
             ),
-            Span::styled(
-                "♥     ",
-                Style::default()
-                    .fg(if selected { LIKE } else { MUTED })
-                    .bg(row_bg),
-            ),
-            Span::styled("↗", action_style),
             sel_hint,
         ]));
         lines.push(Line::from(Span::styled(" ", Style::default().bg(row_bg))));
@@ -813,7 +1280,7 @@ fn draw_right_rail(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(BORDER))
-        .style(style_bg());
+        .style(Style::default().bg(SURFACE).fg(TEXT));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -825,49 +1292,53 @@ fn draw_right_rail(frame: &mut Frame, area: Rect, app: &App) {
 
     let lines = vec![
         Line::from(""),
-        Line::from(Span::styled("  What's happening", style_bold())),
+        Line::from(Span::styled("  Compose", style_bold())),
+        Line::from(Span::styled("  n  new post", style_dim())),
+        Line::from(Span::styled("  r  reply", style_dim())),
         Line::from(""),
-        Line::from(Span::styled(
-            "  ┌──────────────────┐",
-            Style::default().fg(BORDER),
-        )),
-        Line::from(Span::styled("  │  press n to post │", style_dim())),
-        Line::from(Span::styled(
-            "  └──────────────────┘",
-            Style::default().fg(BORDER),
-        )),
-        Line::from(""),
-        Line::from(Span::styled("  ───────────────", style_dim())),
-        Line::from(""),
-        Line::from(Span::styled("  Who to follow", style_bold())),
-        Line::from(Span::styled("  (follows ship later)", style_dim())),
-        Line::from(""),
-        Line::from(Span::styled("  ───────────────", style_dim())),
+        Line::from(Span::styled("  ─────────────", style_dim())),
         Line::from(""),
         Line::from(Span::styled("  You", style_dim())),
         Line::from(Span::styled(format!("  @{handle}"), style_accent())),
         Line::from(""),
-        Line::from(Span::styled("  chronological feed", style_dim())),
-        Line::from(Span::styled("  no ads · no algo", style_dim())),
+        Line::from(Span::styled("  Feed mode", style_dim())),
+        Line::from(Span::styled(
+            format!("  {}", app.feed_tab.label()),
+            style_text(),
+        )),
         Line::from(""),
         Line::from(Span::styled(
-            format!("  {} posts loaded", app.posts.len()),
+            format!("  {} loaded", app.posts.len()),
             style_dim(),
         )),
+        Line::from(""),
+        Line::from(Span::styled("  no algo for now((", style_dim())),
+        Line::from(Span::styled("  chronological only", style_dim())),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
 // ── Composer (tweet box) ────────────────────────────────────────────────────
 
+enum ComposeMode {
+    New,
+    Reply,
+    Edit,
+}
+
 fn draw_composer(
     frame: &mut Frame,
     area: Rect,
     textarea: &tui_textarea::TextArea,
     error: Option<&str>,
+    mode: ComposeMode,
 ) {
-    let popup = centered_rect(70, 42, area);
-    frame.render_widget(Clear, popup);
+    let (title, prompt) = match mode {
+        ComposeMode::New => ("Post", "What's happening?"),
+        ComposeMode::Reply => ("Reply", "Post your reply"),
+        ComposeMode::Edit => ("Edit", "Edit your post"),
+    };
+    let inner = begin_popup(frame, centered_rect(70, 42, area), title);
 
     let content = textarea.lines().join("\n");
     let count = content.chars().count();
@@ -880,15 +1351,6 @@ fn draw_composer(
         style_dim()
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(PURPLE))
-        .title(Span::styled(" Post ", style_accent()))
-        .style(Style::default().bg(SURFACE).fg(TEXT))
-        .padding(Padding::horizontal(1));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -899,11 +1361,11 @@ fn draw_composer(
         .split(inner);
 
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled("What's happening?", style_dim()))),
+        Paragraph::new(Line::from(Span::styled(prompt, style_dim())))
+            .style(Style::default().bg(SURFACE)),
         chunks[0],
     );
 
-    // Textarea with surface bg
     let mut ta = textarea.clone();
     ta.set_style(Style::default().fg(TEXT).bg(SURFACE));
     ta.set_cursor_style(Style::default().bg(PURPLE).fg(Color::Black));
@@ -917,54 +1379,706 @@ fn draw_composer(
     if let Some(e) = error {
         foot.insert(0, Line::from(Span::styled(e, style_err())));
     }
-    frame.render_widget(Paragraph::new(foot), chunks[2]);
+    frame.render_widget(
+        Paragraph::new(foot).style(Style::default().bg(SURFACE)),
+        chunks[2],
+    );
 }
 
 // ── Overlays ────────────────────────────────────────────────────────────────
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(50, 55, area);
-    frame.render_widget(Clear, popup);
+    let popup = begin_popup(frame, centered_rect(60, 85, area), "Help");
     let lines = vec![
         Line::from(Span::styled("  Keyboard shortcuts", style_bold())),
         Line::from(""),
+        Line::from(Span::styled("  Feed", style_dim())),
         Line::from(vec![
-            Span::styled("  j / k     ", style_accent()),
-            Span::styled("scroll feed", style_text()),
+            Span::styled("  j/k  n r e ␣ ⏎ d  ", style_accent()),
+            Span::styled("scroll/post/reply/edit/like/thread/del", style_text()),
         ]),
         Line::from(vec![
-            Span::styled("  n         ", style_accent()),
-            Span::styled("new post", style_text()),
+            Span::styled("  Tab             ", style_accent()),
+            Span::styled("For you ↔ Following", style_text()),
         ]),
         Line::from(vec![
-            Span::styled("  r         ", style_accent()),
-            Span::styled("refresh timeline", style_text()),
+            Span::styled("  /  i  m  p  f   ", style_accent()),
+            Span::styled("search · notifs · DMs · author profile · follow", style_text()),
         ]),
         Line::from(vec![
-            Span::styled("  Shift+L   ", style_accent()),
-            Span::styled("logout → accounts", style_text()),
+            Span::styled("  Shift+p        ", style_accent()),
+            Span::styled("your own profile", style_text()),
         ]),
         Line::from(vec![
-            Span::styled("  q         ", style_accent()),
-            Span::styled("quit", style_text()),
+            Span::styled("  u  ?  q  S-L    ", style_accent()),
+            Span::styled("refresh · help · quit · logout", style_text()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("  Profile", style_dim())),
+        Line::from(vec![
+            Span::styled("  f b m           ", style_accent()),
+            Span::styled("follow · block · DM (others)", style_text()),
         ]),
         Line::from(vec![
-            Span::styled("  ?         ", style_accent()),
-            Span::styled("this help", style_text()),
+            Span::styled("  e               ", style_accent()),
+            Span::styled("edit bio (your profile only)", style_text()),
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "  conr is chronological. No algorithm.",
+            "  #tags and @mentions work in posts.",
+            style_dim(),
+        )),
+        Line::from(Span::styled("  Esc to close", style_dim())),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(SURFACE).fg(TEXT)),
+        popup,
+    );
+}
+
+fn draw_search(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c::SearchState) {
+    let (side, main, rail) = shell_columns(area);
+    draw_sidebar(frame, side, app, "search");
+    if let Some(r) = rail {
+        draw_right_rail(frame, r, app);
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .split(main);
+
+    let cursor = if state.editing { "▌" } else { "" };
+    let q = if state.query.is_empty() && state.editing {
+        format!("  Search posts, @people, #tags {cursor}")
+    } else {
+        format!("  {}", state.query) + cursor
+    };
+    let box_style = if state.editing {
+        Style::default().fg(PURPLE)
+    } else {
+        Style::default().fg(BORDER)
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled("  Explore", style_bold())),
+            Line::from(Span::styled(q, style_text())),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(box_style)
+                .style(style_bg()),
+        ),
+        chunks[0],
+    );
+
+    let mut lines = Vec::new();
+    if let Some(e) = &state.error {
+        lines.push(Line::from(Span::styled(format!("  {e}"), style_err())));
+    }
+    for (i, hit) in state.hits.iter().enumerate() {
+        let sel = !state.editing && i == state.selected;
+        let bg = if sel { SELECT_BG } else { BG };
+        let (kind, body) = match hit {
+            SearchHit::Post(p) => (
+                "post",
+                format!("@{}  {}", p.author_handle, p.display_content()),
+            ),
+            SearchHit::User(u) => (
+                "user",
+                format!(
+                    "@{}  · {} followers · {} posts",
+                    u.handle, u.followers, u.posts
+                ),
+            ),
+            SearchHit::Tag(n, c) => ("tag", format!("#{n}  · {c} posts")),
+        };
+        let kind_style = Style::default().fg(PURPLE).bg(bg);
+        let body_style = if sel {
+            Style::default()
+                .fg(TEXT)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT).bg(bg)
+        };
+        let trunc: String = body
+            .chars()
+            .take((main.width as usize).saturating_sub(12))
+            .collect();
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {kind:<4}  "), kind_style),
+            Span::styled(trunc, body_style),
+        ]));
+    }
+    if state.hits.is_empty() && state.error.is_none() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Type a query and press Enter",
+            style_dim(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Try  rust   @alice   #conr",
+            style_dim(),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).style(style_bg()), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  {} · Enter open · / retype · Esc back", app.status),
+            style_dim(),
+        )))
+        .style(Style::default().bg(SURFACE2)),
+        chunks[2],
+    );
+}
+
+fn draw_profile(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c::ProfileState) {
+    let (side, main, _) = shell_columns(area);
+    draw_sidebar(frame, side, app, "profile");
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .split(main);
+
+    let p = &state.profile;
+    let avatar = avatar_glyph(&p.handle);
+    // Own profile: edit bio only. Others: follow / DM / block — never "e bio".
+    let actions = if p.is_me {
+        "you  ·  e edit bio  ·  Esc".to_string()
+    } else {
+        let follow = if p.followed_by_me {
+            "f unfollow"
+        } else {
+            "f follow"
+        };
+        let block = if p.blocked_by_me {
+            "b unblock"
+        } else {
+            "b block"
+        };
+        format!("{follow}  ·  m message  ·  {block}  ·  Esc")
+    };
+    let header = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                format!(" {avatar} "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(AVATAR_BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  @{}", p.handle), style_bold()),
+        ]),
+        Line::from(Span::styled(
+            format!("    {}", p.bio.as_deref().unwrap_or("No bio yet.")),
+            style_dim(),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "    {} posts   {} followers   {} following",
+                p.posts, p.followers, p.following
+            ),
+            style_text(),
+        )),
+        Line::from(Span::styled(
+            format!("    {actions}"),
+            Style::default().fg(PURPLE),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(header).block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(BORDER))
+                .style(style_bg()),
+        ),
+        chunks[0],
+    );
+
+    let mut lines = Vec::new();
+    if state.posts.is_empty() {
+        lines.push(Line::from(Span::styled("  No posts yet.", style_dim())));
+    } else {
+        for (i, post) in state.posts.iter().enumerate() {
+            let sel = i == state.selected;
+            let bg = if sel { SELECT_BG } else { BG };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {} · {}",
+                    relative_time(post.created_at),
+                    if post.edited_at.is_some() {
+                        "edited"
+                    } else {
+                        ""
+                    }
+                ),
+                Style::default().fg(MUTED).bg(bg),
+            )));
+            let body: String = post.display_content().chars().take(90).collect();
+            lines.push(Line::from(Span::styled(
+                format!("  {body}"),
+                Style::default()
+                    .fg(if post.deleted_at.is_some() {
+                        MUTED
+                    } else {
+                        TEXT
+                    })
+                    .bg(bg),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  ↩ {}   ♡ {}", post.reply_count, post.like_count),
+                Style::default().fg(MUTED).bg(bg),
+            )));
+            lines.push(Line::from(Span::styled(" ", Style::default().bg(bg))));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).style(style_bg()), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  {}", app.status),
+            style_dim(),
+        )))
+        .style(Style::default().bg(SURFACE2)),
+        chunks[2],
+    );
+}
+
+fn draw_notifications(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    state: &crate::phase_c::NotifState,
+) {
+    let (side, main, _) = shell_columns(area);
+    draw_sidebar(frame, side, app, "notifs");
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .split(main);
+
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled("  Notifications", style_bold())),
+            Line::from(Span::styled("  Enter open · Esc back", style_dim())),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(BORDER))
+                .style(style_bg()),
+        ),
+        chunks[0],
+    );
+
+    let mut lines = Vec::new();
+    if state.items.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  You're all caught up.",
+            style_dim(),
+        )));
+    }
+    for (i, n) in state.items.iter().enumerate() {
+        let sel = i == state.selected;
+        let bg = if sel { SELECT_BG } else { BG };
+        let (icon, text) = match n.kind.as_str() {
+            "like" => ("♡", format!("@{} liked your post", n.actor_handle)),
+            "reply" => ("↩", format!("@{} replied to you", n.actor_handle)),
+            "follow" => ("+", format!("@{} followed you", n.actor_handle)),
+            "mention" => ("@", format!("@{} mentioned you", n.actor_handle)),
+            other => ("·", format!("@{} · {other}", n.actor_handle)),
+        };
+        let icon_col = match n.kind.as_str() {
+            "like" => LIKE,
+            "follow" => OK,
+            "mention" => PURPLE,
+            _ => MUTED,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {icon}  "), Style::default().fg(icon_col).bg(bg)),
+            Span::styled(text, Style::default().fg(TEXT).bg(bg)),
+            Span::styled(
+                format!("  {}", relative_time(n.created_at)),
+                Style::default().fg(MUTED).bg(bg),
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines).style(style_bg()), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  {}", app.status),
+            style_dim(),
+        )))
+        .style(Style::default().bg(SURFACE2)),
+        chunks[2],
+    );
+}
+
+fn draw_dm_list(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c::DmListState) {
+    let (side, main, _) = shell_columns(area);
+    draw_sidebar(frame, side, app, "messages");
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .split(main);
+
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled("  Messages", style_bold())),
+            Line::from(Span::styled(
+                "  n new chat  ·  Enter open  ·  u refresh",
+                style_dim(),
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(BORDER))
+                .style(style_bg()),
+        ),
+        chunks[0],
+    );
+
+    let mut lines = Vec::new();
+    if state.items.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  No conversations yet.",
+            style_dim(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Press n and type a handle to start chatting.",
+            style_dim(),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Or open a profile (p) and press m.",
+            Style::default().fg(PURPLE),
+        )));
+    }
+    for (i, c) in state.items.iter().enumerate() {
+        let sel = i == state.selected;
+        let bg = if sel { SELECT_BG } else { BG };
+        let preview = c
+            .last_message
+            .as_deref()
+            .map(|s| {
+                let t: String = s.chars().take(48).collect();
+                t
+            })
+            .unwrap_or_else(|| "—".into());
+        let time = c.last_at.map(relative_time).unwrap_or_else(|| "".into());
+        let av = avatar_glyph(&c.peer_handle);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {av} "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(if sel { PURPLE } else { PURPLE_DIM }),
+            ),
+            Span::styled(
+                format!(" @{}", c.peer_handle),
+                Style::default()
+                    .fg(TEXT)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {time}"), Style::default().fg(MUTED).bg(bg)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("     {preview}"),
+            Style::default().fg(MUTED).bg(bg),
+        )));
+        lines.push(Line::from(Span::styled(" ", Style::default().bg(bg))));
+    }
+    frame.render_widget(Paragraph::new(lines).style(style_bg()), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  {}", app.status),
+            style_dim(),
+        )))
+        .style(Style::default().bg(SURFACE2)),
+        chunks[2],
+    );
+}
+
+fn draw_dm_new(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c::DmNewState) {
+    let (side, main, _) = shell_columns(area);
+    draw_sidebar(frame, side, app, "messages");
+
+    let popup = centered_rect(50, 40, main);
+    frame.render_widget(Clear, popup);
+
+    let mut lines = vec![
+        Line::from(Span::styled("  New message", style_bold())),
+        Line::from(""),
+        Line::from(Span::styled("  Who do you want to message?", style_dim())),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  @{}▌", state.handle),
+            style_accent(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("  Enter continue · Esc cancel", style_dim())),
+    ];
+    if let Some(e) = &state.error {
+        lines.insert(5, Line::from(Span::styled(format!("  {e}"), style_err())));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(PURPLE))
+                .style(Style::default().bg(SURFACE).fg(TEXT))
+                .padding(Padding::new(1, 1, 0, 0)),
+        ),
+        popup,
+    );
+}
+
+fn draw_dm_thread(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c::DmThreadState) {
+    let (side, main, _) = shell_columns(area);
+    draw_sidebar(frame, side, app, "messages");
+
+    let me = app
+        .session
+        .as_ref()
+        .map(|s| s.handle.as_str())
+        .unwrap_or("");
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(5),
+            Constraint::Length(1),
+        ])
+        .split(main);
+
+    // Header
+    let title = format!("  @{}", state.peer_handle);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(title, style_bold())),
+            Line::from(Span::styled(
+                "  Enter send  ·  Esc back to inbox",
+                style_dim(),
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(BORDER))
+                .style(style_bg()),
+        ),
+        chunks[0],
+    );
+
+    // Message bubbles
+    let mut lines: Vec<Line> = Vec::new();
+    if state.messages.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  Say hi to @{}…", state.peer_handle),
+            style_dim(),
+        )));
+    } else {
+        // show a window ending near scroll
+        let total = state.messages.len();
+        let view_h = (chunks[1].height as usize).saturating_sub(1).max(4);
+        let end = (state.scroll + 1).min(total);
+        let start = end.saturating_sub(view_h);
+        for m in &state.messages[start..end] {
+            let mine = m.sender_handle == me;
+            let time = relative_time(m.created_at);
+            let max_w = (chunks[1].width as usize).saturating_sub(8).max(20);
+            let body_lines = wrap_text(&m.content, max_w.saturating_sub(4));
+
+            if mine {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{:>width$}",
+                        format!("you · {time}"),
+                        width = chunks[1].width as usize
+                    ),
+                    style_dim(),
+                )));
+                for bl in &body_lines {
+                    let pad = chunks[1].width as usize;
+                    let bubble = format!("  {bl}  ");
+                    let styled = format!("{:>width$}", bubble, width = pad);
+                    lines.push(Line::from(Span::styled(
+                        styled,
+                        Style::default().fg(TEXT).bg(BUBBLE_ME),
+                    )));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("  @{} · {time}", m.sender_handle),
+                    style_dim(),
+                )));
+                for bl in &body_lines {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {bl}  "),
+                        Style::default().fg(TEXT).bg(BUBBLE_THEM),
+                    )));
+                }
+            }
+            lines.push(Line::from(""));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).style(style_bg()), chunks[1]);
+
+    // Composer
+    let count = state.draft.lines().join("\n").chars().count();
+    let mut ta = state.draft.clone();
+    ta.set_style(Style::default().fg(TEXT).bg(SURFACE2));
+    ta.set_cursor_style(Style::default().bg(PURPLE).fg(Color::Black));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(PURPLE))
+        .title(Span::styled(
+            format!(" message  {count}/{POST_MAX_LEN} "),
+            style_accent(),
+        ))
+        .style(Style::default().bg(SURFACE2));
+    let inner = block.inner(chunks[2]);
+    frame.render_widget(block, chunks[2]);
+    frame.render_widget(&ta, inner);
+
+    let mut foot = app.status.clone();
+    if let Some(e) = &state.error {
+        foot = e.clone();
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  {foot}"),
+            if state.error.is_some() {
+                style_err()
+            } else {
+                style_dim()
+            },
+        )))
+        .style(Style::default().bg(SURFACE2)),
+        chunks[3],
+    );
+}
+
+fn draw_edit_bio(frame: &mut Frame, area: Rect, input: &str, error: Option<&str>) {
+    let popup = begin_popup(frame, centered_rect(60, 30, area), "Bio");
+    let mut lines = vec![
+        Line::from(Span::styled("  Edit bio (160 chars)", style_bold())),
+        Line::from(""),
+        Line::from(Span::styled(format!("  {input}_"), style_text())),
+        Line::from(""),
+        Line::from(Span::styled("  Enter save · Esc cancel", style_dim())),
+    ];
+    if let Some(e) = error {
+        lines.insert(3, Line::from(Span::styled(format!("  {e}"), style_err())));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(SURFACE).fg(TEXT)),
+        popup,
+    );
+}
+
+fn draw_block_user(
+    frame: &mut Frame,
+    area: Rect,
+    handle: &str,
+    reason: &str,
+    error: Option<&str>,
+) {
+    use conr_shared::BLOCK_REASON_MAX_LEN;
+    let popup = begin_popup(frame, centered_rect(64, 40, area), "Block");
+    let n = reason.chars().count();
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("  Block @{handle}?"),
+            style_bold(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  A reason is required (you won't see their posts).",
             style_dim(),
         )),
         Line::from(""),
-        Line::from(Span::styled("  Esc to close", style_dim())),
+        Line::from(Span::styled(
+            format!("  {reason}_"),
+            style_text(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {n}/{BLOCK_REASON_MAX_LEN}  ·  Enter block  ·  Esc cancel"),
+            style_dim(),
+        )),
     ];
-    frame.render_widget(Paragraph::new(lines).block(card_block("Help")), popup);
+    if let Some(e) = error {
+        lines.insert(
+            5,
+            Line::from(Span::styled(format!("  {e}"), style_err())),
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(SURFACE).fg(TEXT)),
+        popup,
+    );
+}
+
+fn draw_confirm_delete(frame: &mut Frame, area: Rect, preview: &str) {
+    let popup = begin_popup(frame, centered_rect(56, 36, area), "Confirm");
+    let lines = vec![
+        Line::from(Span::styled("  Delete this post?", style_bold())),
+        Line::from(""),
+        Line::from(Span::styled(format!("  “{preview}”"), style_dim())),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Replies stay; content becomes [Deleted].",
+            style_dim(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  y / Enter  ", style_accent()),
+            Span::styled("delete", style_text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  n / Esc    ", style_accent()),
+            Span::styled("cancel", style_text()),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(SURFACE).fg(TEXT)),
+        popup,
+    );
 }
 
 fn draw_reminder(frame: &mut Frame, area: Rect, message: &str) {
-    let popup = centered_rect(64, 45, area);
+    let popup = begin_popup(frame, centered_rect(64, 45, area), "Reminder");
     let lines = vec![
         Line::from(Span::styled("  Token reminder", style_bold())),
         Line::from(""),
@@ -984,7 +2098,7 @@ fn draw_reminder(frame: &mut Frame, area: Rect, message: &str) {
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(card_block("Reminder")),
+            .style(Style::default().bg(SURFACE).fg(TEXT)),
         popup,
     );
 }

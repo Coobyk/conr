@@ -73,6 +73,7 @@ impl Config {
         Ok(cfg)
     }
 
+    #[allow(dead_code)]
     pub fn save(&self) -> Result<()> {
         let path = config_dir()?.join("config.toml");
         fs::write(&path, toml::to_string_pretty(self)?)?;

@@ -389,17 +389,24 @@ dim = "#5A5A5A"
 - Open registration, minimal in-memory rate limits
 - Server URL from config.toml
 
-### Phase B — Soon after
+### Phase B — Shipped
 
-- Likes (toggle + count)
+- Likes (toggle + count; WS `LikeUpdated`)
 - Multi-level replies (unbounded depth), thread view (refetch on open is OK)
-- Tombstone delete (`[Deleted]`, keep children)
+- Tombstone delete (`[Deleted]`, keep children; WS `PostDeleted`)
 
-### Phase C — Later
+### Phase C — Shipped
 
-- Follows, search/FTS, tags index
-- Edit posts (maybe never)
-- Blocks, notifications, images, spam, DMs
+- Follows + Following feed tab
+- Search (FTS posts, users, `#tags`)
+- Tags index (`post_tags`)
+- Edit posts (`edited_at`)
+- Blocks (mutual hide + unfollow)
+- Notifications (like, reply, follow, mention)
+- DMs (1:1 conversations)
+- Profile + bio
+- Simple post rate limit (60/hour)
+- No binary images (URLs in text are fine); no analytics
 
 ### Content rules (server-enforced)
 
@@ -416,11 +423,25 @@ dim = "#5A5A5A"
 | POST | `/auth/register` | `{ "handle" }` → `{ token, access_token, refresh_token, user }` once |
 | POST | `/auth/login` | `{ "handle", "token" }` |
 | POST | `/auth/refresh` | rotate refresh |
-| GET | `/feed` | top-level posts, cursor pagination |
-| POST | `/posts` | create top-level post; reject reply/`parent_id` until Phase B |
-| GET | `/ws` | auth’d; `NewPost`, `Pong`, `Error` |
-
-Phase B adds: `GET /posts/:id` (thread tree), likes routes, allow `parent_id` on create.
+| GET | `/feed` | top-level posts, cursor pagination (includes like/reply counts) |
+| POST | `/posts` | create post; optional `parent_id` for replies |
+| GET | `/posts/:id` | thread tree (root + all descendants) |
+| DELETE | `/posts/:id` | tombstone (author only) |
+| POST | `/posts/:id/like` | toggle like |
+| PATCH | `/posts/:id` | edit own post |
+| GET | `/feed?filter=following` | following-only feed |
+| GET | `/users/:handle` | profile |
+| GET | `/users/:handle/posts` | user posts |
+| POST/DELETE | `/users/:handle/follow` | follow / unfollow |
+| POST/DELETE | `/users/:handle/block` | block / unblock |
+| PATCH | `/me/bio` | update bio |
+| GET | `/search?q=` | FTS / users / tags |
+| GET | `/tags/:tag` | posts for tag |
+| GET | `/notifications` | list |
+| POST | `/notifications/read` | mark all read |
+| GET/POST | `/dms` | list / start DM by handle |
+| GET/POST | `/dms/:id` | thread / send |
+| GET | `/ws` | auth’d; `NewPost`, `PostDeleted`, `PostEdited`, `LikeUpdated`, `Notification`, `DmMessage`, `Pong`, `Error` |
 
 ---
 
@@ -463,8 +484,9 @@ cargo run -p conr-client
 | Phase | Scope |
 | --- | --- |
 | **A — First ship** | Auth, token UX, feed, post, WS, cache, XDG config |
-| **B** | Likes, multi-level replies, tombstone delete |
-| **C** | Follows, search, media, abuse tooling, whatever friends ask for |
+| **B** (done) | Likes, multi-level replies, tombstone delete |
+| **C** (done) | Follows, search, tags, blocks, notifs, DMs, edit, profile |
+| later | Binary media, spam tooling, polish |
 
 ---
 
