@@ -7,7 +7,7 @@ use ratatui::Frame;
 use chrono::{DateTime, Utc};
 use conr_shared::{format_token_block, POST_MAX_LEN};
 
-use crate::app::{post_depth, App, MenuEntry, ReturnTo, Screen};
+use crate::app::{post_depth, App, MenuEntry, ReturnTo, Screen, SettingsBack};
 use crate::phase_c::{FeedTab, SearchHit};
 
 // ── Palette (ink dark + violet) ─────────────────────────────────────────────
@@ -103,24 +103,6 @@ fn gradient_hairline(width: usize, phase: f32) -> Line<'static> {
     Line::from(spans)
 }
 
-fn status_gradient_line(text: &str, phase: f32) -> Line<'static> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
-        return Line::from("");
-    }
-    let n = chars.len().max(1) as f32;
-    let mut spans = Vec::with_capacity(chars.len());
-    for (i, ch) in chars.into_iter().enumerate() {
-        let t = (i as f32 / n + phase * 0.05).rem_euclid(1.0);
-        let c = lerp_color(MUTED, PURPLE, 0.08 + 0.18 * (t * std::f32::consts::TAU).sin().abs());
-        spans.push(Span::styled(
-            ch.to_string(),
-            Style::default().fg(c).bg(SURFACE2),
-        ));
-    }
-    Line::from(spans)
-}
-
 /// density: 0.0 sparse … 1.0 party (welcome / login).
 fn draw_sparkle_field(frame: &mut Frame, area: Rect, phase: f32, density: f32) {
     draw_sparkle_field_on(frame, area, phase, density, BG);
@@ -200,7 +182,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // Sparkles: login / welcome background only (sidebar sparkles drawn in draw_feed).
     if matches!(
         app.screen,
-        Screen::WelcomeMenu { .. } | Screen::Login { .. }
+        Screen::WelcomeMenu { .. } | Screen::Login { .. } | Screen::Settings { .. }
     ) {
         draw_sparkle_field(frame, area, app.ui_secs(), 0.95);
     }
@@ -237,6 +219,21 @@ pub fn draw(frame: &mut Frame, app: &App) {
             focus,
             error,
         } => draw_login(frame, area, handle, token_input, *focus, error.as_deref()),
+        Screen::Settings {
+            server_url,
+            auto_login,
+            focus,
+            error,
+            back,
+        } => draw_settings(
+            frame,
+            area,
+            server_url,
+            *auto_login,
+            *focus,
+            error.as_deref(),
+            back,
+        ),
         Screen::Feed => draw_feed(frame, area, app),
         Screen::Thread => draw_thread(frame, area, app),
         Screen::Compose {
@@ -380,8 +377,19 @@ fn draw_welcome_menu(frame: &mut Frame, area: Rect, app: &App, selected: usize) 
         all.push(Line::from(Span::styled(format!("  {}", app.status), st)));
     }
     all.push(Line::from(""));
+    // Truncate long tunnel URLs so the card stays tidy.
+    let url = app.config.server_url.as_str();
+    let url_disp: String = if url.chars().count() > 36 {
+        format!("{}…", url.chars().take(35).collect::<String>())
+    } else {
+        url.to_string()
+    };
     all.push(Line::from(Span::styled(
-        "  j/k  ·  Enter to continue",
+        format!("  server  {url_disp}"),
+        style_dim(),
+    )));
+    all.push(Line::from(Span::styled(
+        "  j/k  ·  Enter  ·  t settings",
         style_dim(),
     )));
 
@@ -669,7 +677,7 @@ fn draw_login(
         Line::from(Span::styled(t, t_style)),
         Line::from(""),
         Line::from(Span::styled(
-            "  Tab switch field  ·  Enter submit  ·  Esc back",
+            "  Tab field  ·  Enter submit  ·  Ctrl+T settings  ·  Esc",
             style_dim(),
         )),
     ];
@@ -677,6 +685,80 @@ fn draw_login(
         lines.insert(5, Line::from(Span::styled(format!("  {e}"), style_err())));
     }
     frame.render_widget(Paragraph::new(lines).block(card_block("Log in")), popup);
+}
+
+fn draw_settings(
+    frame: &mut Frame,
+    area: Rect,
+    server_url: &str,
+    auto_login: bool,
+    focus: usize,
+    error: Option<&str>,
+    back: &SettingsBack,
+) {
+    let popup = begin_popup(frame, centered_rect(62, 55, area), "Settings");
+
+    let url_style = if focus == 0 {
+        Style::default()
+            .fg(TEXT)
+            .bg(SELECT_BG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        style_text()
+    };
+    let auto_style = if focus == 1 {
+        Style::default()
+            .fg(TEXT)
+            .bg(SELECT_BG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        style_text()
+    };
+
+    let cursor = if focus == 0 { "█" } else { "" };
+    let url_line = format!("  {server_url}{cursor}");
+    let auto_mark = if auto_login { "[x]" } else { "[ ]" };
+    let auto_line = format!("  {auto_mark}  auto-login on startup");
+
+    let from = match back {
+        SettingsBack::WelcomeMenu { .. } => "welcome",
+        SettingsBack::Login { .. } => "login",
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled("  Client settings", style_bold())),
+        Line::from(Span::styled(
+            format!("  from {from}  ·  saved to ~/.config/conr/config.toml"),
+            style_dim(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("  Server URL", style_dim())),
+        Line::from(Span::styled(url_line, url_style)),
+        Line::from(""),
+        Line::from(Span::styled("  Preferences", style_dim())),
+        Line::from(Span::styled(auto_line, auto_style)),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Tab/↑↓ fields  ·  Space toggle  ·  Ctrl+R reset URL",
+            style_dim(),
+        )),
+        Line::from(Span::styled(
+            "  Enter save  ·  Esc cancel",
+            style_dim(),
+        )),
+    ];
+    if let Some(e) = error {
+        lines.insert(
+            5,
+            Line::from(Span::styled(format!("  {e}"), style_err())),
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .style(Style::default().bg(SURFACE).fg(TEXT)),
+        popup,
+    );
 }
 
 // ── Main chrome ─────────────────────────────────────────────────────────────
@@ -866,11 +948,7 @@ fn logo_char_style(wave_t: Option<f32>, row: usize, col: usize) -> Style {
 fn draw_timeline(frame: &mut Frame, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Min(4),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(4), Constraint::Min(4)])
         .split(area);
 
     let header_block = Block::default()
@@ -906,18 +984,6 @@ fn draw_timeline(frame: &mut Frame, area: Rect, app: &App) {
     let feed_inner = chunks[1];
     let lines = build_feed_lines(app, feed_inner.width as usize);
     frame.render_widget(Paragraph::new(lines).style(style_bg()), feed_inner);
-
-    let status = if app.status.is_empty() {
-        "  j/k scroll · n post · r reply · ␣ like · ⏎ thread · m messages · / search · ?"
-            .to_string()
-    } else {
-        format!("  {}", app.status)
-    };
-    frame.render_widget(
-        Paragraph::new(status_gradient_line(&status, phase))
-            .style(Style::default().bg(SURFACE2)),
-        chunks[2],
-    );
 }
 
 // ── Thread view ─────────────────────────────────────────────────────────────
@@ -930,11 +996,7 @@ fn draw_thread(frame: &mut Frame, area: Rect, app: &App) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(4),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Min(4)])
         .split(area);
 
     let header_block = Block::default()
@@ -964,17 +1026,6 @@ fn draw_thread(frame: &mut Frame, area: Rect, app: &App) {
     let feed_inner = chunks[1];
     let lines = build_thread_lines(posts, selected, feed_inner.width as usize);
     frame.render_widget(Paragraph::new(lines).style(style_bg()), feed_inner);
-
-    let status = if app.status.is_empty() {
-        "  j/k  ·  r reply  ·  ␣ like  ·  d delete  ·  u refresh  ·  Esc back".to_string()
-    } else {
-        format!("  {}", app.status)
-    };
-    frame.render_widget(
-        Paragraph::new(status_gradient_line(&status, app.ui_secs()))
-            .style(Style::default().bg(SURFACE2)),
-        chunks[2],
-    );
 }
 
 fn build_thread_lines(
@@ -1445,11 +1496,7 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c:
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Min(4),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(4), Constraint::Min(4)])
         .split(main);
 
     let cursor = if state.editing { "▌" } else { "" };
@@ -1528,14 +1575,6 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c:
         )));
     }
     frame.render_widget(Paragraph::new(lines).style(style_bg()), chunks[1]);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("  {} · Enter open · / retype · Esc back", app.status),
-            style_dim(),
-        )))
-        .style(Style::default().bg(SURFACE2)),
-        chunks[2],
-    );
 }
 
 fn draw_profile(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c::ProfileState) {
@@ -1544,11 +1583,7 @@ fn draw_profile(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8),
-            Constraint::Min(4),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(8), Constraint::Min(4)])
         .split(main);
 
     let p = &state.profile;
@@ -1645,14 +1680,6 @@ fn draw_profile(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c
         }
     }
     frame.render_widget(Paragraph::new(lines).style(style_bg()), chunks[1]);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("  {}", app.status),
-            style_dim(),
-        )))
-        .style(Style::default().bg(SURFACE2)),
-        chunks[2],
-    );
 }
 
 fn draw_notifications(
@@ -1666,11 +1693,7 @@ fn draw_notifications(
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(4),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Min(4)])
         .split(main);
 
     frame.render_widget(
@@ -1721,14 +1744,6 @@ fn draw_notifications(
         ]));
     }
     frame.render_widget(Paragraph::new(lines).style(style_bg()), chunks[1]);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("  {}", app.status),
-            style_dim(),
-        )))
-        .style(Style::default().bg(SURFACE2)),
-        chunks[2],
-    );
 }
 
 fn draw_dm_list(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c::DmListState) {
@@ -1737,11 +1752,7 @@ fn draw_dm_list(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(4),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Min(4)])
         .split(main);
 
     frame.render_widget(
@@ -1814,14 +1825,6 @@ fn draw_dm_list(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c
         lines.push(Line::from(Span::styled(" ", Style::default().bg(bg))));
     }
     frame.render_widget(Paragraph::new(lines).style(style_bg()), chunks[1]);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("  {}", app.status),
-            style_dim(),
-        )))
-        .style(Style::default().bg(SURFACE2)),
-        chunks[2],
-    );
 }
 
 fn draw_dm_new(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c::DmNewState) {
@@ -1874,7 +1877,6 @@ fn draw_dm_thread(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase
             Constraint::Length(3),
             Constraint::Min(6),
             Constraint::Length(5),
-            Constraint::Length(1),
         ])
         .split(main);
 
@@ -1957,34 +1959,30 @@ fn draw_dm_thread(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase
     let mut ta = state.draft.clone();
     ta.set_style(Style::default().fg(TEXT).bg(SURFACE2));
     ta.set_cursor_style(Style::default().bg(PURPLE).fg(Color::Black));
+    let composer_title = if let Some(e) = &state.error {
+        format!(" error · {e} ")
+    } else {
+        format!(" message  {count}/{POST_MAX_LEN} ")
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(PURPLE))
+        .border_style(Style::default().fg(if state.error.is_some() {
+            ERR
+        } else {
+            PURPLE
+        }))
         .title(Span::styled(
-            format!(" message  {count}/{POST_MAX_LEN} "),
-            style_accent(),
+            composer_title,
+            if state.error.is_some() {
+                style_err()
+            } else {
+                style_accent()
+            },
         ))
         .style(Style::default().bg(SURFACE2));
     let inner = block.inner(chunks[2]);
     frame.render_widget(block, chunks[2]);
     frame.render_widget(&ta, inner);
-
-    let mut foot = app.status.clone();
-    if let Some(e) = &state.error {
-        foot = e.clone();
-    }
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("  {foot}"),
-            if state.error.is_some() {
-                style_err()
-            } else {
-                style_dim()
-            },
-        )))
-        .style(Style::default().bg(SURFACE2)),
-        chunks[3],
-    );
 }
 
 fn draw_edit_bio(frame: &mut Frame, area: Rect, input: &str, error: Option<&str>) {

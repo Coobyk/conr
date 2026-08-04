@@ -89,6 +89,15 @@ pub enum Screen {
         focus: usize, // 0 handle 1 token
         error: Option<String>,
     },
+    /// Pre-auth client settings (server URL, auto-login, …).
+    Settings {
+        server_url: String,
+        auto_login: bool,
+        /// 0 = server URL field, 1 = auto-login toggle
+        focus: usize,
+        error: Option<String>,
+        back: SettingsBack,
+    },
     Feed,
     Thread,
     Compose {
@@ -137,6 +146,20 @@ pub enum Screen {
     },
     Help {
         return_to: ReturnTo,
+    },
+}
+
+/// Where Settings returns after Esc / save.
+#[derive(Debug, Clone)]
+pub enum SettingsBack {
+    WelcomeMenu {
+        selected: usize,
+    },
+    Login {
+        handle: String,
+        token_input: String,
+        focus: usize,
+        error: Option<String>,
     },
 }
 
@@ -373,8 +396,65 @@ impl App {
                 Screen::WelcomeAnim { .. }
                     | Screen::WelcomeMenu { .. }
                     | Screen::Login { .. }
+                    | Screen::Settings { .. }
                     | Screen::Feed
             )
+    }
+
+    fn open_settings(&mut self, back: SettingsBack) {
+        self.screen = Screen::Settings {
+            server_url: self.config.server_url.clone(),
+            auto_login: self.reminders.auto_login,
+            focus: 0,
+            error: None,
+            back,
+        };
+    }
+
+    fn leave_settings(&mut self, back: SettingsBack) {
+        self.screen = match back {
+            SettingsBack::WelcomeMenu { selected } => Screen::WelcomeMenu { selected },
+            SettingsBack::Login {
+                handle,
+                token_input,
+                focus,
+                error,
+            } => Screen::Login {
+                handle,
+                token_input,
+                focus,
+                error,
+            },
+        };
+    }
+
+    fn apply_settings(&mut self, server_url: &str, auto_login: bool) -> Result<(), String> {
+        let url = server_url.trim();
+        if url.is_empty() {
+            return Err("server URL cannot be empty".into());
+        }
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err("URL must start with http:// or https://".into());
+        }
+        // Basic sanity — reject spaces and control chars.
+        if url.chars().any(|c| c.is_whitespace()) {
+            return Err("URL must not contain spaces".into());
+        }
+
+        let normalized = url.trim_end_matches('/').to_string();
+        self.config.server_url = normalized.clone();
+        if let Err(e) = self.config.save() {
+            return Err(format!("could not save config: {e:#}"));
+        }
+        self.api.set_server_url(&normalized);
+
+        self.reminders.auto_login = auto_login;
+        if let Err(e) = self.reminders.save() {
+            return Err(format!("could not save prefs: {e:#}"));
+        }
+
+        self.status = format!("server → {normalized}");
+        Ok(())
     }
 
     fn handle_client_event(&mut self, ev: ClientEvent) {
@@ -537,6 +617,15 @@ impl App {
                 input.push_str(text);
                 *error = None;
             }
+            Screen::Settings {
+                server_url,
+                focus,
+                error,
+                ..
+            } if *focus == 0 => {
+                server_url.push_str(text.trim());
+                *error = None;
+            }
             Screen::Compose { textarea, .. } => {
                 textarea.insert_str(text);
             }
@@ -560,6 +649,7 @@ impl App {
                 | Screen::UnlockConfirm { .. }
                 | Screen::BackupPassphrase { .. }
                 | Screen::Login { .. }
+                | Screen::Settings { focus: 0, .. }
                 | Screen::Compose { .. }
                 | Screen::EditBio { .. }
                 | Screen::BlockUser { .. }
@@ -656,11 +746,22 @@ impl App {
                         Some(MenuEntry::Quit) | None => self.request_quit(),
                     }
                 }
+                // Settings: change server URL, auto-login, etc.
+                KeyCode::Char('t') | KeyCode::Char('T')
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.open_settings(SettingsBack::WelcomeMenu { selected });
+                }
                 _ => {
                     self.screen = Screen::WelcomeMenu { selected };
                 }
             }
             return Ok(());
+        }
+
+        // Settings screen (pre-auth).
+        if matches!(self.screen, Screen::Settings { .. }) {
+            return self.handle_settings_key(key);
         }
 
         // Phase C screens
@@ -890,6 +991,18 @@ impl App {
                         selected: n + 1, // Register=n, ManualLogin=n+1
                     };
                 }
+                // Ctrl+T → settings (plain `t` is typed into handle/token).
+                KeyCode::Char('t') | KeyCode::Char('T')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    let back = SettingsBack::Login {
+                        handle: handle.clone(),
+                        token_input: token_input.clone(),
+                        focus: *focus,
+                        error: error.clone(),
+                    };
+                    self.open_settings(back);
+                }
                 KeyCode::Tab => *focus = 1 - *focus,
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if *focus == 0 {
@@ -927,6 +1040,7 @@ impl App {
                 }
                 _ => {}
             },
+            Screen::Settings { .. } => {} // handled above
             Screen::Feed => match key.code {
                 // Logout: stop silent auto-login, KEEP all identity tokens, show picker.
                 KeyCode::Char('L') if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -1051,7 +1165,12 @@ impl App {
                     // follow author of selected post
                     if let Some(post) = self.posts.get(self.selected) {
                         let h = post.author_handle.clone();
-                        if self.session.as_ref().map(|s| s.handle == h).unwrap_or(false) {
+                        if self
+                            .session
+                            .as_ref()
+                            .map(|s| s.handle == h)
+                            .unwrap_or(false)
+                        {
                             self.status = "that's you".into();
                         } else {
                             match self.api.follow(&h).await {
@@ -1080,8 +1199,7 @@ impl App {
                 KeyCode::Char('d') => {
                     if let Some(post) = self.posts.get(self.selected) {
                         if self.is_mine(post) && post.deleted_at.is_none() {
-                            let preview: String =
-                                post.display_content().chars().take(40).collect();
+                            let preview: String = post.display_content().chars().take(40).collect();
                             self.screen = Screen::ConfirmDelete {
                                 post_id: post.id.clone(),
                                 preview,
@@ -1180,8 +1298,7 @@ impl App {
                                 ReturnTo::Feed => {
                                     if let Some(pid) = parent {
                                         if let Err(e) = self.open_thread(&pid).await {
-                                            self.status =
-                                                format!("reply ok, open thread: {e:#}");
+                                            self.status = format!("reply ok, open thread: {e:#}");
                                             self.go_home();
                                         }
                                     } else {
@@ -1197,9 +1314,7 @@ impl App {
                 textarea.input(key);
             }
             Screen::ConfirmDelete {
-                post_id,
-                return_to,
-                ..
+                post_id, return_to, ..
             } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     let id = post_id.clone();
@@ -1246,10 +1361,7 @@ impl App {
             }
             Screen::Reminder { .. } => {
                 // Must dismiss before other shortcuts work (q still quits globally).
-                if matches!(
-                    key.code,
-                    KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ')
-                ) {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ')) {
                     let _ = self.reminders.acknowledge();
                     self.go_home();
                 }
@@ -1265,6 +1377,74 @@ impl App {
             | Screen::EditBio { .. }
             | Screen::BlockUser { .. } => {} // phase_c
             Screen::Boot => {}
+        }
+
+        Ok(())
+    }
+
+    fn handle_settings_key(&mut self, key: KeyEvent) -> Result<()> {
+        let Screen::Settings {
+            server_url,
+            auto_login,
+            focus,
+            error,
+            back,
+        } = &mut self.screen
+        else {
+            return Ok(());
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                let back = back.clone();
+                self.leave_settings(back);
+            }
+            // Tab / arrows move between fields (letters type into the URL when focused).
+            KeyCode::Tab | KeyCode::Down => {
+                *focus = (*focus + 1) % 2;
+                *error = None;
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                *focus = focus.checked_sub(1).unwrap_or(1);
+                *error = None;
+            }
+            KeyCode::Char(' ') if *focus == 1 => {
+                *auto_login = !*auto_login;
+                *error = None;
+            }
+            // Ctrl+R → reset server URL to local default.
+            KeyCode::Char('r') | KeyCode::Char('R')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                *server_url = "http://127.0.0.1:8080".into();
+                *error = None;
+            }
+            KeyCode::Char(c)
+                if *focus == 0 && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if server_url.len() < 256 {
+                    server_url.push(c);
+                }
+                *error = None;
+            }
+            KeyCode::Backspace if *focus == 0 => {
+                server_url.pop();
+                *error = None;
+            }
+            KeyCode::Enter => {
+                let url = server_url.clone();
+                let auto = *auto_login;
+                let back = back.clone();
+                match self.apply_settings(&url, auto) {
+                    Ok(()) => self.leave_settings(back),
+                    Err(e) => {
+                        if let Screen::Settings { error, .. } = &mut self.screen {
+                            *error = Some(e);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1330,8 +1510,7 @@ impl App {
             KeyCode::Char('d') => {
                 if let Some(post) = selected_post {
                     if self.is_mine(&post) && post.deleted_at.is_none() {
-                        let preview: String =
-                            post.display_content().chars().take(40).collect();
+                        let preview: String = post.display_content().chars().take(40).collect();
                         self.screen = Screen::ConfirmDelete {
                             post_id: post.id,
                             preview,
@@ -1495,10 +1674,7 @@ impl App {
     pub(crate) async fn open_thread(&mut self, post_id: &str) -> Result<()> {
         let resp = self.api.get_thread(post_id).await?;
         let ordered = order_thread_dfs(&resp.posts, &resp.root.id);
-        let selected = ordered
-            .iter()
-            .position(|p| p.id == post_id)
-            .unwrap_or(0);
+        let selected = ordered.iter().position(|p| p.id == post_id).unwrap_or(0);
         self.thread = Some(ThreadState {
             root_id: resp.root.id,
             posts: ordered,
@@ -1534,11 +1710,7 @@ impl App {
         }
         self.selected = 0;
         self.feed_scroll = 0;
-        self.status = format!(
-            "{} · {} posts",
-            self.feed_tab.label(),
-            self.posts.len()
-        );
+        self.status = format!("{} · {} posts", self.feed_tab.label(), self.posts.len());
         // Keep social graph caches fresh for live filters.
         let _ = self.refresh_social_sets().await;
         // refresh unread badge

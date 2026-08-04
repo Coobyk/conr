@@ -25,7 +25,7 @@ pub struct Api {
 
 impl Api {
     pub fn new(server_url: &str) -> Result<Self> {
-        let base = server_url.trim_end_matches('/').to_string();
+        let base = Self::normalize_base(server_url);
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
@@ -34,6 +34,15 @@ impl Api {
             base,
             tokens: Arc::new(Mutex::new(Tokens::default())),
         })
+    }
+
+    fn normalize_base(server_url: &str) -> String {
+        server_url.trim().trim_end_matches('/').to_string()
+    }
+
+    /// Point the client at a different server (login / settings). Clears nothing else.
+    pub fn set_server_url(&mut self, server_url: &str) {
+        self.base = Self::normalize_base(server_url);
     }
 
     pub fn set_tokens(&self, access: String, refresh: String) {
