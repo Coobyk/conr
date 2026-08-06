@@ -58,6 +58,7 @@ Data (cache, backups, logs): `~/.local/share/conr/`.
 
 - Global chronological feed + **Following** tab (`Tab`)
 - Compose posts (512 chars), `#hashtags`, `@mentions`
+- Post markup: `**bold**`, `__underline__`, `~~strike~~`, `{red}color{/}`
 - WebSocket live updates
 - Offline SQLite cache
 

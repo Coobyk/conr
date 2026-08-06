@@ -1082,19 +1082,29 @@ fn build_thread_lines(
         ]));
 
         let body = p.display_content();
-        let body_style = if p.deleted_at.is_some() {
-            Style::default()
+        if p.deleted_at.is_some() {
+            let body_style = Style::default()
                 .fg(MUTED)
                 .bg(row_bg)
-                .add_modifier(Modifier::ITALIC)
+                .add_modifier(Modifier::ITALIC);
+            for wrap_line in wrap_text(body, content_width) {
+                lines.push(Line::from(Span::styled(
+                    format!("{indent}    {wrap_line}"),
+                    body_style,
+                )));
+            }
         } else {
-            Style::default().fg(TEXT).bg(row_bg)
-        };
-        for wrap_line in wrap_text(body, content_width) {
-            lines.push(Line::from(Span::styled(
-                format!("{indent}    {wrap_line}"),
-                body_style,
-            )));
+            let prefix = Span::styled(
+                format!("{indent}    "),
+                Style::default().fg(TEXT).bg(row_bg),
+            );
+            lines.extend(crate::ui::markup::styled_body_lines_prefixed(
+                body,
+                content_width,
+                TEXT,
+                row_bg,
+                prefix,
+            ));
         }
 
         let like_label = if p.liked_by_me {
@@ -1205,19 +1215,31 @@ fn build_feed_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
         // Body (wrapped); tombstones render as [Deleted]
         let body = p.display_content();
-        let body_style = if p.deleted_at.is_some() {
-            Style::default()
+        if p.deleted_at.is_some() {
+            let body_style = Style::default()
                 .fg(MUTED)
                 .bg(row_bg)
-                .add_modifier(Modifier::ITALIC)
+                .add_modifier(Modifier::ITALIC);
+            for wrap_line in wrap_text(body, content_width) {
+                lines.push(Line::from(vec![
+                    Span::styled(gutter, gutter_style),
+                    Span::styled(format!("   {wrap_line}"), body_style),
+                ]));
+            }
         } else {
-            Style::default().fg(TEXT).bg(row_bg)
-        };
-        for wrap_line in wrap_text(body, content_width) {
-            lines.push(Line::from(vec![
-                Span::styled(gutter, gutter_style),
-                Span::styled(format!("   {wrap_line}"), body_style),
-            ]));
+            let mut body_lines = crate::ui::markup::styled_body_lines_prefixed(
+                body,
+                content_width,
+                TEXT,
+                row_bg,
+                Span::styled("   ", Style::default().fg(TEXT).bg(row_bg)),
+            );
+            for bl in &mut body_lines {
+                let mut spans = vec![Span::styled(gutter, gutter_style)];
+                spans.extend(bl.spans.drain(..));
+                *bl = Line::from(spans);
+            }
+            lines.extend(body_lines);
         }
 
         // Action row with live counts
@@ -1389,7 +1411,7 @@ fn draw_composer(
         ComposeMode::Reply => ("Reply", "Post your reply"),
         ComposeMode::Edit => ("Edit", "Edit your post"),
     };
-    let inner = begin_popup(frame, centered_rect(70, 42, area), title);
+    let inner = begin_popup(frame, centered_rect(70, 48, area), title);
 
     let content = textarea.lines().join("\n");
     let count = content.chars().count();
@@ -1407,7 +1429,7 @@ fn draw_composer(
         .constraints([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(inner);
 
@@ -1422,11 +1444,17 @@ fn draw_composer(
     ta.set_cursor_style(Style::default().bg(PURPLE).fg(Color::Black));
     frame.render_widget(&ta, chunks[1]);
 
-    let mut foot = vec![Line::from(vec![
-        Span::styled("Ctrl+S Post", style_accent()),
-        Span::styled("  ·  Esc cancel  ·  ", style_dim()),
-        Span::styled(format!("{count}/{POST_MAX_LEN}"), count_style),
-    ])];
+    let mut foot = vec![
+        Line::from(Span::styled(
+            "**bold**  __under__  ~~strike~~  {red}color{/}",
+            style_dim(),
+        )),
+        Line::from(vec![
+            Span::styled("Ctrl+S Post", style_accent()),
+            Span::styled("  ·  Esc cancel  ·  ", style_dim()),
+            Span::styled(format!("{count}/{POST_MAX_LEN}"), count_style),
+        ]),
+    ];
     if let Some(e) = error {
         foot.insert(0, Line::from(Span::styled(e, style_err())));
     }
@@ -1439,7 +1467,7 @@ fn draw_composer(
 // ── Overlays ────────────────────────────────────────────────────────────────
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = begin_popup(frame, centered_rect(60, 85, area), "Help");
+    let popup = begin_popup(frame, centered_rect(64, 90, area), "Help");
     let lines = vec![
         Line::from(Span::styled("  Keyboard shortcuts", style_bold())),
         Line::from(""),
@@ -1475,11 +1503,32 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             Span::styled("edit bio (your profile only)", style_text()),
         ]),
         Line::from(""),
+        Line::from(""),
+        Line::from(Span::styled("  Post markup", style_dim())),
+        Line::from(vec![
+            Span::styled("  **bold**        ", style_accent()),
+            Span::styled("bold text", style_text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  __underline__   ", style_accent()),
+            Span::styled("underlined", style_text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  ~~strike~~      ", style_accent()),
+            Span::styled("strikethrough", style_text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  {red}hi{/}      ", style_accent()),
+            Span::styled("named color (also green, blue, …)", style_text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  @name  #tag    ", style_accent()),
+            Span::styled("auto-highlighted", style_text()),
+        ]),
         Line::from(Span::styled(
-            "  #tags and @mentions work in posts.",
+            "  Escape specials with \\  ·  Esc close",
             style_dim(),
         )),
-        Line::from(Span::styled("  Esc to close", style_dim())),
     ];
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(SURFACE).fg(TEXT)),
@@ -1534,7 +1583,11 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c:
         let (kind, body) = match hit {
             SearchHit::Post(p) => (
                 "post",
-                format!("@{}  {}", p.author_handle, p.display_content()),
+                format!(
+                    "@{}  {}",
+                    p.author_handle,
+                    crate::ui::markup::strip_markup(p.display_content())
+                ),
             ),
             SearchHit::User(u) => (
                 "user",
@@ -1661,17 +1714,34 @@ fn draw_profile(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c
                 ),
                 Style::default().fg(MUTED).bg(bg),
             )));
-            let body: String = post.display_content().chars().take(90).collect();
-            lines.push(Line::from(Span::styled(
-                format!("  {body}"),
-                Style::default()
-                    .fg(if post.deleted_at.is_some() {
-                        MUTED
-                    } else {
-                        TEXT
-                    })
-                    .bg(bg),
-            )));
+            if post.deleted_at.is_some() {
+                let body: String = post.display_content().chars().take(90).collect();
+                lines.push(Line::from(Span::styled(
+                    format!("  {body}"),
+                    Style::default().fg(MUTED).bg(bg),
+                )));
+            } else if post.display_content().chars().count() <= 90 {
+                let preview_w = (main.width as usize).saturating_sub(4).max(20);
+                let body_lines = crate::ui::markup::styled_body_lines_prefixed(
+                    post.display_content(),
+                    preview_w,
+                    TEXT,
+                    bg,
+                    Span::styled("  ", Style::default().fg(TEXT).bg(bg)),
+                );
+                if let Some(first) = body_lines.into_iter().next() {
+                    lines.push(first);
+                }
+            } else {
+                let body: String = crate::ui::markup::strip_markup(post.display_content())
+                    .chars()
+                    .take(90)
+                    .collect();
+                lines.push(Line::from(Span::styled(
+                    format!("  {body}"),
+                    Style::default().fg(TEXT).bg(bg),
+                )));
+            }
             lines.push(Line::from(Span::styled(
                 format!("  ↩ {}   ♡ {}", post.reply_count, post.like_count),
                 Style::default().fg(MUTED).bg(bg),
@@ -1917,7 +1987,13 @@ fn draw_dm_thread(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase
             let mine = m.sender_handle == me;
             let time = relative_time(m.created_at);
             let max_w = (chunks[1].width as usize).saturating_sub(8).max(20);
-            let body_lines = wrap_text(&m.content, max_w.saturating_sub(4));
+            let bubble_w = max_w.saturating_sub(4);
+            let body_lines = crate::ui::markup::styled_body_lines(
+                &m.content,
+                bubble_w,
+                TEXT,
+                if mine { BUBBLE_ME } else { BUBBLE_THEM },
+            );
 
             if mine {
                 lines.push(Line::from(Span::styled(
@@ -1929,13 +2005,29 @@ fn draw_dm_thread(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase
                     style_dim(),
                 )));
                 for bl in &body_lines {
-                    let pad = chunks[1].width as usize;
-                    let bubble = format!("  {bl}  ");
-                    let styled = format!("{:>width$}", bubble, width = pad);
-                    lines.push(Line::from(Span::styled(
-                        styled,
+                    // Right-align bubble: pad with spaces on the left (plain bg).
+                    let visible: usize = bl.spans.iter().map(|s| s.content.chars().count()).sum();
+                    let bubble_inner = visible + 4; // "  " + content + "  "
+                    let pad = (chunks[1].width as usize).saturating_sub(bubble_inner);
+                    let mut spans = vec![Span::styled(
+                        " ".repeat(pad),
+                        Style::default().bg(BG),
+                    )];
+                    spans.push(Span::styled(
+                        "  ",
                         Style::default().fg(TEXT).bg(BUBBLE_ME),
-                    )));
+                    ));
+                    for s in &bl.spans {
+                        spans.push(Span::styled(
+                            s.content.to_string(),
+                            s.style.bg(BUBBLE_ME),
+                        ));
+                    }
+                    spans.push(Span::styled(
+                        "  ",
+                        Style::default().fg(TEXT).bg(BUBBLE_ME),
+                    ));
+                    lines.push(Line::from(spans));
                 }
             } else {
                 lines.push(Line::from(Span::styled(
@@ -1943,10 +2035,21 @@ fn draw_dm_thread(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase
                     style_dim(),
                 )));
                 for bl in &body_lines {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {bl}  "),
+                    let mut spans = vec![Span::styled(
+                        "  ",
                         Style::default().fg(TEXT).bg(BUBBLE_THEM),
-                    )));
+                    )];
+                    for s in &bl.spans {
+                        spans.push(Span::styled(
+                            s.content.to_string(),
+                            s.style.bg(BUBBLE_THEM),
+                        ));
+                    }
+                    spans.push(Span::styled(
+                        "  ",
+                        Style::default().fg(TEXT).bg(BUBBLE_THEM),
+                    ));
+                    lines.push(Line::from(spans));
                 }
             }
             lines.push(Line::from(""));
