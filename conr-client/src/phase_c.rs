@@ -1,6 +1,6 @@
 //! Phase C screens: search, profile, notifications, DMs, feed tab helpers.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use conr_shared::{
     DmConversation, DmMessage, Notification, BLOCK_REASON_MAX_LEN, POST_MAX_LEN, SearchResponse,
     UserProfile,
@@ -54,6 +54,8 @@ pub struct ProfileState {
     pub profile: UserProfile,
     pub posts: Vec<conr_shared::Post>,
     pub selected: usize,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
 }
 
 #[derive(Debug)]
@@ -276,29 +278,47 @@ impl App {
     }
 
     pub async fn open_profile(&mut self, handle: &str) -> Result<()> {
-        let handle = handle.trim().trim_start_matches('@');
+        let handle = handle
+            .trim()
+            .trim_start_matches('@')
+            .to_ascii_lowercase();
         if handle.is_empty() {
             anyhow::bail!("empty handle");
         }
-        let profile = self
-            .api
-            .get_profile(handle)
-            .await
-            .with_context(|| format!("load profile @{handle}"))?;
-        let posts = self
-            .api
-            .profile_posts(handle)
-            .await
-            .with_context(|| format!("load posts @{handle}"))?
-            .posts;
-        self.screen = Screen::Profile {
-            state: ProfileState {
-                profile,
-                posts,
-                selected: 0,
-            },
-        };
-        self.status = format!("@{handle}");
+        self.pending_profile = Some(handle.clone());
+        let is_me = self
+            .session
+            .as_ref()
+            .map(|s| s.handle.eq_ignore_ascii_case(&handle))
+            .unwrap_or(false);
+
+        // Instant: memory → disk posts → empty shell.
+        if let Some(cached) = self.view_cache.profile(&handle) {
+            self.screen = Screen::Profile {
+                state: ProfileState {
+                    profile: cached.profile.clone(),
+                    posts: cached.posts.clone(),
+                    selected: 0,
+                    next_cursor: cached.next_cursor.clone(),
+                    has_more: cached.has_more,
+                },
+            };
+            self.status = format!("@{handle}");
+        } else {
+            let posts = self.cache.by_author(&handle, 40).unwrap_or_default();
+            let profile = App::stub_profile(&handle, is_me);
+            self.screen = Screen::Profile {
+                state: ProfileState {
+                    profile,
+                    posts,
+                    selected: 0,
+                    next_cursor: None,
+                    has_more: true,
+                },
+            };
+            self.status = format!("@{handle} · loading…");
+        }
+        self.spawn_load_profile(handle);
         Ok(())
     }
 
@@ -313,11 +333,27 @@ impl App {
                         state.selected = (state.selected + 1).min(state.posts.len() - 1);
                     }
                 }
+                self.maybe_load_more_profile();
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if let Screen::Profile { state } = &mut self.screen {
                     state.selected = state.selected.saturating_sub(1);
                 }
+            }
+            KeyCode::Char('g') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if let Screen::Profile { state } = &mut self.screen {
+                    state.selected = 0;
+                }
+            }
+            KeyCode::Char('G') | KeyCode::Char('g')
+                if key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                if let Screen::Profile { state } = &mut self.screen {
+                    if !state.posts.is_empty() {
+                        state.selected = state.posts.len() - 1;
+                    }
+                }
+                self.maybe_load_more_profile();
             }
             KeyCode::Enter => {
                 let id = if let Screen::Profile { state } = &self.screen {
@@ -449,17 +485,28 @@ impl App {
     }
 
     pub async fn open_notifications(&mut self) -> Result<()> {
-        let resp = self.api.notifications().await?;
-        let _ = self.api.mark_notifications_read().await;
-        self.unread_notifs = 0;
-        self.screen = Screen::Notifications {
-            state: NotifState {
-                items: resp.notifications,
-                selected: 0,
-                unread: resp.unread,
-            },
-        };
-        self.status = "notifications".into();
+        // Instant from memory; mark-read + refresh run in the background.
+        if let Some(items) = self.view_cache.notifications() {
+            self.screen = Screen::Notifications {
+                state: NotifState {
+                    items: items.to_vec(),
+                    selected: 0,
+                    unread: 0,
+                },
+            };
+            self.unread_notifs = 0;
+            self.status = "notifications".into();
+        } else {
+            self.screen = Screen::Notifications {
+                state: NotifState {
+                    items: Vec::new(),
+                    selected: 0,
+                    unread: 0,
+                },
+            };
+            self.status = "loading notifications…".into();
+        }
+        self.spawn_load_notifications();
         Ok(())
     }
 
@@ -509,14 +556,24 @@ impl App {
     // ── Direct messages ─────────────────────────────────────────────────────
 
     pub async fn open_dm_list(&mut self) -> Result<()> {
-        let resp = self.api.list_dms().await?;
-        self.screen = Screen::DmList {
-            state: DmListState {
-                items: resp.conversations,
-                selected: 0,
-            },
-        };
-        self.status = "messages · n new · Enter open".into();
+        if let Some(items) = self.view_cache.dm_list() {
+            self.screen = Screen::DmList {
+                state: DmListState {
+                    items: items.to_vec(),
+                    selected: 0,
+                },
+            };
+            self.status = "messages · n new · Enter open".into();
+        } else {
+            self.screen = Screen::DmList {
+                state: DmListState {
+                    items: Vec::new(),
+                    selected: 0,
+                },
+            };
+            self.status = "loading messages…".into();
+        }
+        self.spawn_load_dm_list();
         Ok(())
     }
 
@@ -526,22 +583,51 @@ impl App {
         if handle.is_empty() {
             anyhow::bail!("empty handle");
         }
-        // Prefer existing conversation so history loads.
-        if let Ok(list) = self.api.list_dms().await {
-            if let Some(c) = list
-                .conversations
-                .iter()
-                .find(|c| c.peer_handle == handle)
-            {
-                return self.open_dm_thread(&c.id).await;
-            }
+
+        // Memory: full thread by peer.
+        if let Some(th) = self.view_cache.dm_thread_by_peer(&handle) {
+            let conv_id = th.conversation_id.clone();
+            let peer = th.peer_handle.clone();
+            let messages = th.messages.clone();
+            let n = messages.len();
+            self.pending_dm = Some(conv_id.clone());
+            self.note_dm_opened(&conv_id);
+            let mut draft = TextArea::default();
+            draft.set_placeholder_text("Write a message…");
+            self.screen = Screen::DmThread {
+                state: DmThreadState {
+                    conversation_id: conv_id.clone(),
+                    peer_handle: peer,
+                    messages,
+                    draft,
+                    error: None,
+                    scroll: n.saturating_sub(1),
+                },
+            };
+            self.status = format!("@{} · chat", handle);
+            self.spawn_load_dm_thread(conv_id.clone(), conv_id);
+            return Ok(());
         }
+
+        // Memory: DM list entry → open by id.
+        let existing_id = self.view_cache.dm_list().and_then(|list| {
+            list.iter()
+                .find(|c| c.peer_handle == handle)
+                .map(|c| c.id.clone())
+        });
+        if let Some(id) = existing_id {
+            return self.open_dm_thread(&id).await;
+        }
+
+        // New empty chat UI immediately; resolve existing convo in the background.
+        let request_key = format!("peer:{handle}");
+        self.pending_dm = Some(request_key.clone());
         let mut draft = TextArea::default();
         draft.set_placeholder_text("Write a message…");
         self.screen = Screen::DmThread {
             state: DmThreadState {
                 conversation_id: String::new(),
-                peer_handle: handle,
+                peer_handle: handle.clone(),
                 messages: Vec::new(),
                 draft,
                 error: None,
@@ -549,25 +635,90 @@ impl App {
             },
         };
         self.status = "new chat · Enter send · Esc back".into();
+
+        let api = self.api.clone();
+        let tx = self.event_tx.clone();
+        let peer = handle.clone();
+        tokio::spawn(async move {
+            if let Ok(list) = api.list_dms().await {
+                let _ = tx.send(crate::app::ClientEvent::DmListLoaded {
+                    items: list.conversations.clone(),
+                });
+                if let Some(c) = list
+                    .conversations
+                    .iter()
+                    .find(|c| c.peer_handle == peer)
+                {
+                    if let Ok(resp) = api.get_dm(&c.id).await {
+                        let _ = tx.send(crate::app::ClientEvent::DmThreadLoaded {
+                            request_key,
+                            conversation_id: resp.conversation.id,
+                            peer_handle: resp.conversation.peer_handle,
+                            messages: resp.messages,
+                        });
+                        return;
+                    }
+                }
+            }
+            // No existing conversation — stay on empty new-chat UI.
+        });
         Ok(())
     }
 
+    fn note_dm_opened(&mut self, conversation_id: &str) {
+        if let Some(list) = self.view_cache.dm_list() {
+            if let Some(c) = list.iter().find(|c| c.id == conversation_id) {
+                self.unread_dms = self.unread_dms.saturating_sub(c.unread);
+            }
+        }
+        self.view_cache.clear_dm_unread(conversation_id);
+    }
+
     pub async fn open_dm_thread(&mut self, id: &str) -> Result<()> {
-        let resp = self.api.get_dm(id).await?;
+        self.pending_dm = Some(id.to_string());
+        self.note_dm_opened(id);
         let mut draft = TextArea::default();
         draft.set_placeholder_text("Write a message…");
-        let n = resp.messages.len();
+
+        if let Some(th) = self.view_cache.dm_thread(id) {
+            let n = th.messages.len();
+            self.screen = Screen::DmThread {
+                state: DmThreadState {
+                    conversation_id: th.conversation_id.clone(),
+                    peer_handle: th.peer_handle.clone(),
+                    messages: th.messages.clone(),
+                    draft,
+                    error: None,
+                    scroll: n.saturating_sub(1),
+                },
+            };
+            self.status = format!("@{} · chat", th.peer_handle);
+            self.spawn_load_dm_thread(id.to_string(), id.to_string());
+            return Ok(());
+        }
+
+        // Instant shell from list metadata if we have it.
+        let peer = self
+            .view_cache
+            .dm_list()
+            .and_then(|list| {
+                list.iter()
+                    .find(|c| c.id == id)
+                    .map(|c| c.peer_handle.clone())
+            })
+            .unwrap_or_else(|| "…".into());
         self.screen = Screen::DmThread {
             state: DmThreadState {
-                conversation_id: resp.conversation.id,
-                peer_handle: resp.conversation.peer_handle,
-                messages: resp.messages,
+                conversation_id: id.to_string(),
+                peer_handle: peer,
+                messages: Vec::new(),
                 draft,
                 error: None,
-                scroll: n.saturating_sub(1),
+                scroll: 0,
             },
         };
-        self.status = "Enter send · Esc back".into();
+        self.status = "loading chat…".into();
+        self.spawn_load_dm_thread(id.to_string(), id.to_string());
         Ok(())
     }
 
@@ -910,6 +1061,7 @@ impl App {
             parent_id: None,
             edit_id: Some(post_id.to_string()),
             return_to,
+            color_ac_idx: 0,
         };
     }
 }

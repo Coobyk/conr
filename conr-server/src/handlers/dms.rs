@@ -14,7 +14,14 @@ use crate::db::is_blocked_either;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
-type ConvRow = (String, String, String, Option<String>, Option<DateTime<Utc>>);
+type ConvRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<DateTime<Utc>>,
+    i64,
+);
 
 pub async fn list_conversations(
     State(state): State<Arc<AppState>>,
@@ -34,7 +41,17 @@ pub async fn list_conversations(
                      SELECT m.created_at FROM dm_messages m
                      WHERE m.conversation_id = c.id
                      ORDER BY m.created_at DESC LIMIT 1
-                   ) AS last_at
+                   ) AS last_at,
+                   (
+                     SELECT COUNT(*)::bigint FROM dm_messages m
+                     WHERE m.conversation_id = c.id
+                       AND m.sender_id <> $1
+                       AND m.created_at > COALESCE(
+                             (SELECT r.last_read_at FROM dm_reads r
+                              WHERE r.user_id = $1 AND r.conversation_id = c.id),
+                             '-infinity'::timestamptz
+                           )
+                   ) AS unread
             FROM dm_conversations c
             JOIN dm_participants me ON me.conversation_id = c.id AND me.user_id = $1
             JOIN dm_participants other ON other.conversation_id = c.id AND other.user_id <> $1
@@ -51,7 +68,7 @@ pub async fn list_conversations(
         .fetch_all(&state.db)
         .await?;
 
-    let conversations = rows
+    let conversations: Vec<DmConversation> = rows
         .into_iter()
         .map(|r| DmConversation {
             id: r.0,
@@ -59,10 +76,15 @@ pub async fn list_conversations(
             peer_handle: r.2,
             last_message: r.3,
             last_at: r.4,
+            unread: r.5,
         })
         .collect();
+    let unread = conversations.iter().map(|c| c.unread).sum();
 
-    Ok(Json(DmListResponse { conversations }))
+    Ok(Json(DmListResponse {
+        conversations,
+        unread,
+    }))
 }
 
 pub async fn get_conversation(
@@ -117,6 +139,8 @@ pub async fn get_conversation(
         })
         .collect();
 
+    mark_conversation_read(&state, &user.id, &id).await?;
+
     let last = messages.last();
     Ok(Json(DmThreadResponse {
         conversation: DmConversation {
@@ -125,9 +149,26 @@ pub async fn get_conversation(
             peer_handle,
             last_message: last.map(|m| m.content.clone()),
             last_at: last.map(|m| m.created_at),
+            unread: 0,
         },
         messages,
     }))
+}
+
+async fn mark_conversation_read(state: &AppState, user_id: &str, conv_id: &str) -> ApiResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO dm_reads (user_id, conversation_id, last_read_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (user_id, conversation_id)
+        DO UPDATE SET last_read_at = EXCLUDED.last_read_at
+        "#,
+    )
+    .bind(user_id)
+    .bind(conv_id)
+    .execute(&state.db)
+    .await?;
+    Ok(())
 }
 
 /// Start or continue a DM by peer handle.

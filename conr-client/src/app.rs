@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use conr_shared::{
-    format_token_block, strip_token, validate_token, DmMessage, Event, Notification, Post,
-    POST_MAX_LEN,
+    format_token_block, strip_token, validate_token, DmConversation, DmMessage, Event,
+    Notification, Post, UserProfile, POST_MAX_LEN,
 };
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
@@ -24,6 +25,8 @@ use crate::phase_c::{
 };
 use crate::reminders::ReminderState;
 use crate::ui;
+use crate::ui::theme::Palette;
+use crate::view_cache::{merge_posts_append, ViewCache};
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -107,6 +110,8 @@ pub enum Screen {
         /// When set, Ctrl+S PATCHes this post instead of creating.
         edit_id: Option<String>,
         return_to: ReturnTo,
+        /// Selected row in the color autocomplete list (`{…`).
+        color_ac_idx: usize,
     },
     ConfirmDelete {
         post_id: String,
@@ -173,9 +178,12 @@ pub enum MenuEntry {
     Quit,
 }
 
+pub const FEED_PAGE: i64 = 50;
+
 pub struct App {
     #[allow(dead_code)]
     pub config: Config,
+    pub palette: Palette,
     pub api: Api,
     pub screen: Screen,
     pub session: Option<Session>,
@@ -187,7 +195,14 @@ pub struct App {
     /// Active thread (if any). Survives compose/help/delete overlays.
     pub thread: Option<ThreadState>,
     pub feed_tab: FeedTab,
+    pub feed_next_cursor: Option<String>,
+    pub feed_has_more: bool,
+    feed_loading_more: bool,
+    /// After `G`, keep the caret on the newest last row when a page appends.
+    feed_pin_end: bool,
+    feed_epoch: u64,
     pub unread_notifs: i64,
+    pub unread_dms: i64,
     pub status: String,
     pub ws_connected: bool,
     pub pending_token: Option<String>,
@@ -197,7 +212,13 @@ pub struct App {
     pub following_handles: HashSet<String>,
     /// Handles the session user blocked (live feed filter).
     pub blocked_handles: HashSet<String>,
-    cache: Cache,
+    pub(crate) cache: Cache,
+    /// Session memory for instant page switches (stale-while-revalidate).
+    pub(crate) view_cache: ViewCache,
+    /// In-flight navigation keys so stale responses don't clobber a newer view.
+    pub(crate) pending_profile: Option<String>,
+    pub(crate) pending_thread: Option<String>,
+    pub(crate) pending_dm: Option<String>,
     pub reminders: ReminderState,
     anim_started: Option<Instant>,
     /// Sidebar ASCII logo wave (bold sweep) after returning home.
@@ -205,14 +226,14 @@ pub struct App {
     /// App clock for ambient UI motion (live pulse, gradients).
     pub ui_epoch: Instant,
     event_rx: Option<mpsc::UnboundedReceiver<ClientEvent>>,
-    event_tx: mpsc::UnboundedSender<ClientEvent>,
+    pub(crate) event_tx: mpsc::UnboundedSender<ClientEvent>,
     should_quit: bool,
     /// Bumped to cancel in-flight WebSocket reconnect loops (logout / quit).
     ws_generation: Arc<AtomicU64>,
     quit_flag: Arc<AtomicBool>,
 }
 
-enum ClientEvent {
+pub(crate) enum ClientEvent {
     WsConnected,
     WsDisconnected,
     NewPost(Post),
@@ -222,6 +243,45 @@ enum ClientEvent {
     Notification(Notification),
     DmMessage(DmMessage),
     Status(String),
+    /// Background feed refresh finished.
+    FeedLoaded {
+        epoch: u64,
+        following: bool,
+        posts: Vec<Post>,
+        append: bool,
+        next_cursor: Option<String>,
+        unread: Option<i64>,
+        unread_dms: Option<i64>,
+        following_handles: Option<Vec<String>>,
+        blocked_handles: Option<Vec<String>>,
+    },
+    FeedMoreFailed {
+        epoch: u64,
+    },
+    ProfileLoaded {
+        profile: UserProfile,
+        posts: Vec<Post>,
+        append: bool,
+        next_cursor: Option<String>,
+    },
+    ThreadLoaded {
+        focus_id: String,
+        root_id: String,
+        posts: Vec<Post>,
+    },
+    NotificationsLoaded {
+        items: Vec<Notification>,
+        unread: i64,
+    },
+    DmListLoaded {
+        items: Vec<DmConversation>,
+    },
+    DmThreadLoaded {
+        request_key: String,
+        conversation_id: String,
+        peer_handle: String,
+        messages: Vec<DmMessage>,
+    },
 }
 
 impl App {
@@ -231,8 +291,10 @@ impl App {
         let reminders = ReminderState::load().unwrap_or_default();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let saved_accounts = Self::load_saved_accounts(reminders.handle.as_deref());
+        let palette = Palette::from_theme(&config.theme);
         let mut app = Self {
             config,
+            palette,
             api,
             screen: Screen::WelcomeMenu { selected: 0 },
             session: None,
@@ -241,7 +303,13 @@ impl App {
             feed_scroll: 0,
             thread: None,
             feed_tab: FeedTab::All,
+            feed_next_cursor: None,
+            feed_has_more: true,
+            feed_loading_more: false,
+            feed_pin_end: false,
+            feed_epoch: 0,
             unread_notifs: 0,
+            unread_dms: 0,
             status: String::new(),
             ws_connected: false,
             pending_token: None,
@@ -249,6 +317,10 @@ impl App {
             following_handles: HashSet::new(),
             blocked_handles: HashSet::new(),
             cache,
+            view_cache: ViewCache::new(),
+            pending_profile: None,
+            pending_thread: None,
+            pending_dm: None,
             reminders,
             anim_started: None,
             logo_wave_at: None,
@@ -259,6 +331,11 @@ impl App {
             ws_generation: Arc::new(AtomicU64::new(0)),
             quit_flag: Arc::new(AtomicBool::new(false)),
         };
+        // Seed for-you tab cache from disk so first paint is instant.
+        if !app.posts.is_empty() {
+            app.view_cache
+                .set_feed(FeedTab::All, app.posts.clone());
+        }
         // Silent auto-login only when exactly one saved account + auto_login on.
         // With multiple accounts, land on the picker (last-active preselected at top).
         if app.reminders.auto_login && app.saved_accounts.len() == 1 {
@@ -554,6 +631,7 @@ impl App {
                     .as_ref()
                     .map(|s| s.user_id == msg.sender_id)
                     .unwrap_or(false);
+                self.view_cache.touch_dm_preview(&msg);
                 if let Screen::DmThread { state } = &mut self.screen {
                     let for_this = state.conversation_id == msg.conversation_id
                         || (state.conversation_id.is_empty()
@@ -566,11 +644,267 @@ impl App {
                         state.scroll = state.messages.len().saturating_sub(1);
                     }
                 }
-                if !mine && !matches!(self.screen, Screen::DmThread { .. }) {
-                    self.status = format!("✉ message from @{}", msg.sender_handle);
+                if !mine {
+                    let viewing = matches!(
+                        &self.screen,
+                        Screen::DmThread { state }
+                            if state.conversation_id == msg.conversation_id
+                                || (state.conversation_id.is_empty()
+                                    && state.peer_handle == msg.sender_handle)
+                    );
+                    if viewing {
+                        self.view_cache.clear_dm_unread(&msg.conversation_id);
+                    } else {
+                        self.view_cache.bump_dm_unread(&msg.conversation_id, true);
+                        self.unread_dms = self.unread_dms.saturating_add(1);
+                        self.status = format!("✉ message from @{}", msg.sender_handle);
+                    }
                 }
             }
             ClientEvent::Status(s) => self.status = s,
+            ClientEvent::FeedLoaded {
+                epoch,
+                following,
+                posts,
+                append,
+                next_cursor,
+                unread,
+                unread_dms,
+                following_handles,
+                blocked_handles,
+            } => {
+                if epoch != self.feed_epoch {
+                    return;
+                }
+                self.feed_loading_more = false;
+                let tab = if following {
+                    FeedTab::Following
+                } else {
+                    FeedTab::All
+                };
+                if !following {
+                    let _ = self.cache.upsert_posts(&posts);
+                }
+                if let Some(u) = unread {
+                    self.unread_notifs = u;
+                }
+                if let Some(u) = unread_dms {
+                    self.unread_dms = u;
+                }
+                if let Some(h) = following_handles {
+                    self.following_handles = h.into_iter().collect();
+                }
+                if let Some(h) = blocked_handles {
+                    self.blocked_handles = h.into_iter().collect();
+                }
+                // Keep `self.posts` in sync whenever this is the active tab, even if
+                // another screen is open — so Esc home / compose backdrop stay fresh.
+                if (self.feed_tab == FeedTab::Following) == following {
+                    let keep = self.posts.get(self.selected).map(|p| p.id.clone());
+                    let incoming_len = posts.len() as i64;
+                    if append {
+                        self.posts = merge_posts_append(&self.posts, posts);
+                    } else {
+                        self.posts = posts;
+                    }
+                    self.feed_next_cursor = next_cursor.clone();
+                    self.feed_has_more = incoming_len >= FEED_PAGE && next_cursor.is_some();
+                    self.view_cache.stash_feed_page(
+                        tab,
+                        self.posts.clone(),
+                        self.feed_next_cursor.clone(),
+                        self.feed_has_more,
+                    );
+                    if self.feed_pin_end && append && !self.posts.is_empty() {
+                        self.selected = self.posts.len() - 1;
+                        self.ensure_feed_visible();
+                        if !self.feed_has_more {
+                            self.feed_pin_end = false;
+                        }
+                    } else if let Some(id) = keep {
+                        if let Some(i) = self.posts.iter().position(|p| p.id == id) {
+                            self.selected = i;
+                        } else if !append {
+                            self.selected = 0;
+                            self.feed_scroll = 0;
+                        }
+                    } else if !append {
+                        self.selected = 0;
+                        self.feed_scroll = 0;
+                    }
+                    if matches!(self.screen, Screen::Feed) {
+                        let more = if self.feed_has_more { "+" } else { "" };
+                        self.status = format!(
+                            "{} · {}{more} posts",
+                            self.feed_tab.label(),
+                            self.posts.len()
+                        );
+                    }
+                } else if !append {
+                    self.view_cache.stash_feed_page(tab, posts, next_cursor, true);
+                }
+            }
+            ClientEvent::FeedMoreFailed { epoch } => {
+                if epoch == self.feed_epoch {
+                    self.feed_loading_more = false;
+                }
+            }
+            ClientEvent::ProfileLoaded {
+                profile,
+                posts,
+                append,
+                next_cursor,
+            } => {
+                let handle = profile.handle.to_ascii_lowercase();
+                let _ = self.cache.upsert_posts(&posts);
+                let apply = self.pending_profile.as_deref() == Some(handle.as_str())
+                    || matches!(
+                        &self.screen,
+                        Screen::Profile { state } if state.profile.handle.eq_ignore_ascii_case(&handle)
+                    );
+                if apply {
+                    self.pending_profile = None;
+                    let incoming_len = posts.len() as i64;
+                    let (selected, merged) = if let Screen::Profile { state } = &self.screen {
+                        let merged = if append {
+                            merge_posts_append(&state.posts, posts)
+                        } else {
+                            posts
+                        };
+                        let selected = state
+                            .posts
+                            .get(state.selected)
+                            .and_then(|p| merged.iter().position(|q| q.id == p.id))
+                            .unwrap_or(if append { state.selected } else { 0 });
+                        (selected, merged)
+                    } else {
+                        (0, posts)
+                    };
+                    let has_more = incoming_len >= FEED_PAGE && next_cursor.is_some();
+                    self.view_cache.put_profile_page(
+                        profile.clone(),
+                        merged.clone(),
+                        next_cursor.clone(),
+                        has_more,
+                    );
+                    self.screen = Screen::Profile {
+                        state: ProfileState {
+                            profile,
+                            posts: merged,
+                            selected,
+                            next_cursor,
+                            has_more,
+                        },
+                    };
+                    self.status = format!("@{handle}");
+                } else if !append {
+                    self.view_cache
+                        .put_profile_page(profile, posts, next_cursor, true);
+                }
+            }
+            ClientEvent::ThreadLoaded {
+                focus_id,
+                root_id,
+                posts,
+            } => {
+                let _ = self.cache.upsert_posts(&posts);
+                self.view_cache
+                    .put_thread(root_id.clone(), posts.clone());
+                let want = self.pending_thread.as_deref() == Some(focus_id.as_str())
+                    || matches!(
+                        &self.thread,
+                        Some(th) if th.root_id == root_id
+                            || th.posts.iter().any(|p| p.id == focus_id)
+                    );
+                if want && matches!(self.screen, Screen::Thread | Screen::Compose { return_to: ReturnTo::Thread, .. } | Screen::Help { return_to: ReturnTo::Thread, .. } | Screen::ConfirmDelete { return_to: ReturnTo::Thread, .. })
+                {
+                    self.pending_thread = None;
+                    let selected = posts.iter().position(|p| p.id == focus_id).unwrap_or(0);
+                    self.thread = Some(ThreadState {
+                        root_id,
+                        posts,
+                        selected,
+                    });
+                    if matches!(self.screen, Screen::Thread) {
+                        self.status = "thread".into();
+                    }
+                }
+            }
+            ClientEvent::NotificationsLoaded { items, unread } => {
+                self.view_cache.put_notifications(items.clone());
+                self.unread_notifs = unread;
+                if matches!(self.screen, Screen::Notifications { .. }) {
+                    let selected = if let Screen::Notifications { state } = &self.screen {
+                        state.selected.min(items.len().saturating_sub(1))
+                    } else {
+                        0
+                    };
+                    self.screen = Screen::Notifications {
+                        state: NotifState {
+                            items,
+                            selected,
+                            unread,
+                        },
+                    };
+                    self.status = "notifications".into();
+                }
+            }
+            ClientEvent::DmListLoaded { items } => {
+                self.view_cache.put_dm_list(items.clone());
+                self.unread_dms = self.view_cache.unread_dms();
+                if matches!(self.screen, Screen::DmList { .. }) {
+                    let selected = if let Screen::DmList { state } = &self.screen {
+                        state.selected.min(items.len().saturating_sub(1))
+                    } else {
+                        0
+                    };
+                    self.screen = Screen::DmList {
+                        state: DmListState { items, selected },
+                    };
+                    self.status = "messages · n new · Enter open".into();
+                }
+            }
+            ClientEvent::DmThreadLoaded {
+                request_key,
+                conversation_id,
+                peer_handle,
+                messages,
+            } => {
+                self.view_cache.put_dm_thread(
+                    conversation_id.clone(),
+                    peer_handle.clone(),
+                    messages.clone(),
+                );
+                let apply = self.pending_dm.as_deref() == Some(request_key.as_str())
+                    || matches!(
+                        &self.screen,
+                        Screen::DmThread { state }
+                            if state.conversation_id == conversation_id
+                                || (state.conversation_id.is_empty()
+                                    && state.peer_handle.eq_ignore_ascii_case(&peer_handle))
+                    );
+                if apply {
+                    self.pending_dm = None;
+                    let n = messages.len();
+                    let draft = if let Screen::DmThread { state } = &self.screen {
+                        state.draft.clone()
+                    } else {
+                        let mut t = TextArea::default();
+                        t.set_placeholder_text("Write a message…");
+                        t
+                    };
+                    self.screen = Screen::DmThread {
+                        state: DmThreadState {
+                            conversation_id,
+                            peer_handle,
+                            messages,
+                            draft,
+                            error: None,
+                            scroll: n.saturating_sub(1),
+                        },
+                    };
+                }
+            }
         }
     }
 
@@ -1048,10 +1382,19 @@ impl App {
                     self.session = None;
                     let _ = self.reminders.clear_session();
                     let _ = self.cache.clear();
+                    self.view_cache.clear();
+                    self.pending_profile = None;
+                    self.pending_thread = None;
+                    self.pending_dm = None;
                     self.api.clear_tokens();
                     self.following_handles.clear();
                     self.blocked_handles.clear();
                     self.posts.clear();
+                    self.feed_next_cursor = None;
+                    self.feed_has_more = true;
+                    self.feed_pin_end = false;
+                    self.unread_dms = 0;
+                    self.unread_notifs = 0;
                     self.ws_connected = false;
                     // Stop old WebSocket loop so it stops spamming status after logout.
                     self.ws_generation.fetch_add(1, Ordering::SeqCst);
@@ -1072,22 +1415,26 @@ impl App {
                         self.selected = (self.selected + 1).min(self.posts.len() - 1);
                         self.ensure_feed_visible();
                     }
+                    self.maybe_load_more_feed();
                 }
                 KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Up => {
                     self.selected = self.selected.saturating_sub(1);
                     self.ensure_feed_visible();
                 }
                 KeyCode::Char('g') if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.feed_pin_end = false;
                     self.selected = 0;
                     self.feed_scroll = 0;
                 }
                 KeyCode::Char('G') | KeyCode::Char('g')
                     if key.modifiers.contains(KeyModifiers::SHIFT) =>
                 {
+                    self.feed_pin_end = true;
                     if !self.posts.is_empty() {
                         self.selected = self.posts.len() - 1;
                         self.ensure_feed_visible();
                     }
+                    self.maybe_load_more_feed();
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.open_compose(None, ReturnTo::Feed);
@@ -1110,17 +1457,11 @@ impl App {
                     }
                 }
                 KeyCode::Char('u') | KeyCode::Char('U') => {
-                    if let Err(e) = self.refresh_feed().await {
-                        self.status = format!("refresh failed: {e:#}");
-                    }
+                    self.status = "refreshing…".into();
+                    self.spawn_refresh_feed();
                 }
                 KeyCode::Tab => {
-                    self.feed_tab = self.feed_tab.toggle();
-                    if let Err(e) = self.refresh_feed().await {
-                        self.status = format!("refresh failed: {e:#}");
-                    } else {
-                        self.status = format!("tab: {}", self.feed_tab.label());
-                    }
+                    self.switch_feed_tab();
                 }
                 KeyCode::Char('/') => {
                     self.open_search().await;
@@ -1223,93 +1564,191 @@ impl App {
                 parent_id,
                 edit_id,
                 return_to,
+                color_ac_idx,
             } => {
                 if key.code == KeyCode::Esc {
                     let ret = *return_to;
                     self.return_from(ret);
                     return Ok(());
                 }
-                if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    let content = textarea.lines().join("\n");
-                    let trimmed = content.trim();
-                    if trimmed.is_empty() {
-                        *error = Some("empty post rejected".into());
-                        return Ok(());
-                    }
-                    if trimmed.chars().count() > POST_MAX_LEN {
-                        *error = Some(format!("max {POST_MAX_LEN} characters"));
-                        return Ok(());
-                    }
-                    let parent = parent_id.clone();
-                    let edit = edit_id.clone();
-                    let ret = *return_to;
 
-                    if let Some(eid) = edit {
-                        match self.api.edit_post(&eid, trimmed).await {
-                            Ok(post) => {
-                                Self::apply_edited(&mut self.posts, &post);
-                                let _ = self.cache.upsert_posts(std::slice::from_ref(&post));
-                                if let Some(th) = self.thread.as_mut() {
-                                    Self::apply_edited(&mut th.posts, &post);
-                                }
-                                self.status = "edited".into();
-                                self.return_from(ret);
-                            }
-                            Err(e) => *error = Some(format!("{e:#}")),
+                // Color autocomplete (active after typing `{` / `{re` …)
+                let color_q = crate::ui::compose_edit::active_color_query(textarea);
+                let color_suggestions = color_q
+                    .as_ref()
+                    .map(|q| crate::ui::markup::filter_colors(&q.prefix))
+                    .unwrap_or_default();
+                if !color_suggestions.is_empty() {
+                    if *color_ac_idx >= color_suggestions.len() {
+                        *color_ac_idx = 0;
+                    }
+                    match key.code {
+                        KeyCode::Down => {
+                            *color_ac_idx = (*color_ac_idx + 1) % color_suggestions.len();
+                            return Ok(());
                         }
-                        return Ok(());
-                    }
-
-                    match self.api.create_post(trimmed, parent.as_deref()).await {
-                        Ok(post) => {
-                            if post.parent_id.is_none() {
-                                if !self.posts.iter().any(|p| p.id == post.id) {
-                                    self.posts.insert(0, post.clone());
-                                }
-                                let _ = self.cache.upsert_posts(std::slice::from_ref(&post));
-                                self.selected = 0;
-                            } else if let Some(ref pid) = post.parent_id {
-                                if let Some(p) = self.posts.iter_mut().find(|p| p.id == *pid) {
-                                    p.reply_count += 1;
-                                }
-                            }
-                            self.status = if parent.is_some() {
-                                "replied".into()
+                        KeyCode::Up => {
+                            *color_ac_idx = if *color_ac_idx == 0 {
+                                color_suggestions.len() - 1
                             } else {
-                                "posted".into()
+                                *color_ac_idx - 1
                             };
-                            match ret {
-                                ReturnTo::Thread => {
-                                    let root = self
-                                        .thread
-                                        .as_ref()
-                                        .map(|t| t.root_id.clone())
-                                        .or(parent.clone());
-                                    if let Some(rid) = root {
-                                        if let Err(e) = self.open_thread(&rid).await {
-                                            self.status =
-                                                format!("reply ok, thread refresh: {e:#}");
-                                            self.go_home();
-                                        }
-                                    } else {
-                                        self.go_home();
-                                    }
-                                }
-                                ReturnTo::Feed => {
-                                    if let Some(pid) = parent {
-                                        if let Err(e) = self.open_thread(&pid).await {
-                                            self.status = format!("reply ok, open thread: {e:#}");
-                                            self.go_home();
-                                        }
-                                    } else {
-                                        self.go_home();
-                                    }
-                                }
-                            }
+                            return Ok(());
                         }
-                        Err(e) => *error = Some(format!("{e:#}")),
+                        KeyCode::Tab => {
+                            if let Some(q) = color_q {
+                                let name = color_suggestions[*color_ac_idx];
+                                crate::ui::compose_edit::apply_color_completion(
+                                    textarea, &q, name,
+                                );
+                                *color_ac_idx = 0;
+                            }
+                            return Ok(());
+                        }
+                        // Enter accepts the color only when a menu is open (still Ctrl+S to post).
+                        KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            if let Some(q) = color_q {
+                                let name = color_suggestions[*color_ac_idx];
+                                crate::ui::compose_edit::apply_color_completion(
+                                    textarea, &q, name,
+                                );
+                                *color_ac_idx = 0;
+                            }
+                            return Ok(());
+                        }
+                        _ => {}
                     }
-                    return Ok(());
+                }
+
+                // Markup wrap shortcuts (intercept before tui-textarea's Ctrl+B = back).
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    match key.code {
+                        KeyCode::Char('b') | KeyCode::Char('B') => {
+                            crate::ui::compose_edit::wrap_markup(textarea, "**", "**");
+                            *error = None;
+                            return Ok(());
+                        }
+                        KeyCode::Char('u') | KeyCode::Char('U') => {
+                            crate::ui::compose_edit::wrap_markup(textarea, "__", "__");
+                            *error = None;
+                            return Ok(());
+                        }
+                        KeyCode::Char('t') | KeyCode::Char('T') => {
+                            // Ctrl+T = strikeThrough (Ctrl+I is often consumed by terminals).
+                            crate::ui::compose_edit::wrap_markup(textarea, "~~", "~~");
+                            *error = None;
+                            return Ok(());
+                        }
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            // Ctrl+Y starts a color tag; Tab/Enter picks from autocomplete.
+                            if textarea.selection_range().is_some() {
+                                // Wrap selection: {red}sel{/} via default color then user can retype.
+                                crate::ui::compose_edit::wrap_markup(
+                                    textarea, "{red}", "{/}",
+                                );
+                            } else {
+                                textarea.insert_str("{");
+                            }
+                            *color_ac_idx = 0;
+                            *error = None;
+                            return Ok(());
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            let content = textarea.lines().join("\n");
+                            let trimmed = content.trim();
+                            if trimmed.is_empty() {
+                                *error = Some("empty post rejected".into());
+                                return Ok(());
+                            }
+                            if trimmed.chars().count() > POST_MAX_LEN {
+                                *error = Some(format!("max {POST_MAX_LEN} characters"));
+                                return Ok(());
+                            }
+                            let parent = parent_id.clone();
+                            let edit = edit_id.clone();
+                            let ret = *return_to;
+
+                            if let Some(eid) = edit {
+                                match self.api.edit_post(&eid, trimmed).await {
+                                    Ok(post) => {
+                                        Self::apply_edited(&mut self.posts, &post);
+                                        let _ = self.cache.upsert_posts(std::slice::from_ref(&post));
+                                        if let Some(th) = self.thread.as_mut() {
+                                            Self::apply_edited(&mut th.posts, &post);
+                                        }
+                                        self.status = "edited".into();
+                                        self.return_from(ret);
+                                    }
+                                    Err(e) => *error = Some(format!("{e:#}")),
+                                }
+                                return Ok(());
+                            }
+
+                            match self.api.create_post(trimmed, parent.as_deref()).await {
+                                Ok(post) => {
+                                    if post.parent_id.is_none() {
+                                        if !self.posts.iter().any(|p| p.id == post.id) {
+                                            self.posts.insert(0, post.clone());
+                                        }
+                                        let _ = self.cache.upsert_posts(std::slice::from_ref(&post));
+                                        self.selected = 0;
+                                    } else if let Some(ref pid) = post.parent_id {
+                                        if let Some(p) = self.posts.iter_mut().find(|p| p.id == *pid)
+                                        {
+                                            p.reply_count += 1;
+                                        }
+                                    }
+                                    self.status = if parent.is_some() {
+                                        "replied".into()
+                                    } else {
+                                        "posted".into()
+                                    };
+                                    match ret {
+                                        ReturnTo::Thread => {
+                                            let root = self
+                                                .thread
+                                                .as_ref()
+                                                .map(|t| t.root_id.clone())
+                                                .or(parent.clone());
+                                            if let Some(rid) = root {
+                                                if let Err(e) = self.open_thread(&rid).await {
+                                                    self.status = format!(
+                                                        "reply ok, thread refresh: {e:#}"
+                                                    );
+                                                    self.go_home();
+                                                }
+                                            } else {
+                                                self.go_home();
+                                            }
+                                        }
+                                        ReturnTo::Feed => {
+                                            if let Some(pid) = parent {
+                                                if let Err(e) = self.open_thread(&pid).await {
+                                                    self.status =
+                                                        format!("reply ok, open thread: {e:#}");
+                                                    self.go_home();
+                                                }
+                                            } else {
+                                                self.go_home();
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => *error = Some(format!("{e:#}")),
+                            }
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Typing into an open color tag resets the highlight row.
+                if matches!(key.code, KeyCode::Char(_))
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    *color_ac_idx = 0;
                 }
                 textarea.input(key);
             }
@@ -1586,6 +2025,7 @@ impl App {
             parent_id,
             edit_id: None,
             return_to,
+            color_ac_idx: 0,
         };
     }
 
@@ -1654,6 +2094,9 @@ impl App {
                         resp.liked_by_me,
                     );
                 }
+                if let Some(p) = self.posts.iter().find(|p| p.id == resp.post_id) {
+                    let _ = self.cache.upsert_posts(std::slice::from_ref(p));
+                }
                 self.status = if resp.liked_by_me {
                     format!("liked · {}", resp.like_count)
                 } else {
@@ -1672,16 +2115,55 @@ impl App {
     }
 
     pub(crate) async fn open_thread(&mut self, post_id: &str) -> Result<()> {
-        let resp = self.api.get_thread(post_id).await?;
-        let ordered = order_thread_dfs(&resp.posts, &resp.root.id);
-        let selected = ordered.iter().position(|p| p.id == post_id).unwrap_or(0);
-        self.thread = Some(ThreadState {
-            root_id: resp.root.id,
-            posts: ordered,
-            selected,
-        });
-        self.screen = Screen::Thread;
-        self.status = "thread".into();
+        self.pending_thread = Some(post_id.to_string());
+
+        // 1) Memory cache (any post in a previously opened thread).
+        if let Some(cached) = self.view_cache.thread_for_post(post_id) {
+            let selected = cached
+                .posts
+                .iter()
+                .position(|p| p.id == post_id)
+                .unwrap_or(0);
+            self.thread = Some(ThreadState {
+                root_id: cached.root_id.clone(),
+                posts: cached.posts.clone(),
+                selected,
+            });
+            self.screen = Screen::Thread;
+            self.status = "thread".into();
+            self.spawn_load_thread(post_id.to_string());
+            return Ok(());
+        }
+
+        // 2) Optimistic single-post view from feed / disk / open profile.
+        let mut seed = self.posts.iter().find(|p| p.id == post_id).cloned();
+        if seed.is_none() {
+            if let Screen::Profile { state } = &self.screen {
+                seed = state.posts.iter().find(|p| p.id == post_id).cloned();
+            }
+        }
+        if seed.is_none() {
+            seed = self.cache.get(post_id).ok().flatten();
+        }
+        if let Some(p) = seed {
+            let root_id = p.parent_id.clone().unwrap_or_else(|| p.id.clone());
+            self.thread = Some(ThreadState {
+                root_id,
+                posts: vec![p],
+                selected: 0,
+            });
+            self.screen = Screen::Thread;
+            self.status = "thread · loading…".into();
+        } else {
+            self.thread = Some(ThreadState {
+                root_id: post_id.to_string(),
+                posts: Vec::new(),
+                selected: 0,
+            });
+            self.screen = Screen::Thread;
+            self.status = "loading thread…".into();
+        }
+        self.spawn_load_thread(post_id.to_string());
         Ok(())
     }
 
@@ -1689,9 +2171,11 @@ impl App {
         self.thread = None;
         self.go_home();
         self.play_logo_wave(); // always greet on login / enter
-        if let Err(e) = self.refresh_feed().await {
-            self.status = format!("using cache ({e:#})");
+        // Disk/memory feed is already on screen — refresh in the background.
+        if self.posts.is_empty() {
+            self.status = "loading feed…".into();
         }
+        self.spawn_refresh_feed();
         self.spawn_ws();
         if self.reminders.should_remind() {
             self.screen = Screen::Reminder {
@@ -1701,33 +2185,275 @@ impl App {
         Ok(())
     }
 
+    /// Instant Tab switch: swap in the last snapshot for that tab, revalidate async.
+    pub(crate) fn switch_feed_tab(&mut self) {
+        self.view_cache.stash_feed_page(
+            self.feed_tab,
+            self.posts.clone(),
+            self.feed_next_cursor.clone(),
+            self.feed_has_more,
+        );
+        self.feed_tab = self.feed_tab.toggle();
+        if let Some(cached) = self.view_cache.feed_page(self.feed_tab) {
+            self.posts = cached.posts.clone();
+            self.feed_next_cursor = cached.next_cursor.clone();
+            self.feed_has_more = cached.has_more;
+            self.selected = 0;
+            self.feed_scroll = 0;
+            self.status = format!("tab: {} · {} posts", self.feed_tab.label(), self.posts.len());
+        } else {
+            self.posts.clear();
+            self.feed_next_cursor = None;
+            self.feed_has_more = true;
+            self.selected = 0;
+            self.feed_scroll = 0;
+            self.status = format!("tab: {} · loading…", self.feed_tab.label());
+        }
+        self.spawn_refresh_feed();
+    }
+
+    /// Blocking refresh kept for rare call sites that still await it.
     pub(crate) async fn refresh_feed(&mut self) -> Result<()> {
-        let following = self.feed_tab == FeedTab::Following;
-        let resp = self.api.feed(None, following).await?;
-        self.posts = resp.posts;
-        if !following {
-            let _ = self.cache.upsert_posts(&self.posts);
-        }
-        self.selected = 0;
-        self.feed_scroll = 0;
-        self.status = format!("{} · {} posts", self.feed_tab.label(), self.posts.len());
-        // Keep social graph caches fresh for live filters.
-        let _ = self.refresh_social_sets().await;
-        // refresh unread badge
-        if let Ok(n) = self.api.notifications().await {
-            self.unread_notifs = n.unread;
-        }
+        self.spawn_refresh_feed();
         Ok(())
     }
 
-    pub(crate) async fn refresh_social_sets(&mut self) -> Result<()> {
-        if let Ok(handles) = self.api.list_following().await {
-            self.following_handles = handles.into_iter().collect();
+    pub(crate) fn spawn_refresh_feed(&mut self) {
+        self.feed_epoch = self.feed_epoch.saturating_add(1);
+        let epoch = self.feed_epoch;
+        self.spawn_feed_page(None, false, epoch);
+    }
+
+    fn maybe_load_more_feed(&mut self) {
+        if !self.feed_has_more || self.feed_loading_more {
+            return;
         }
-        if let Ok(handles) = self.api.list_blocks().await {
-            self.blocked_handles = handles.into_iter().collect();
+        if self.posts.is_empty() {
+            return;
         }
-        Ok(())
+        let near_end = self.selected + 3 >= self.posts.len();
+        if !near_end {
+            return;
+        }
+        let cursor = self
+            .feed_next_cursor
+            .clone()
+            .or_else(|| self.posts.last().map(|p| p.id.clone()));
+        let Some(cursor) = cursor else { return };
+        self.feed_loading_more = true;
+        self.status = "loading older posts…".into();
+        self.spawn_feed_page(Some(cursor), true, self.feed_epoch);
+    }
+
+    fn spawn_feed_page(&self, cursor: Option<String>, append: bool, epoch: u64) {
+        let following = self.feed_tab == FeedTab::Following;
+        let api = self.api.clone();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let feed = api.feed(cursor.as_deref(), following).await;
+            match feed {
+                Ok(resp) => {
+                    let mut unread = None;
+                    let mut unread_dms = None;
+                    let mut following_handles = None;
+                    let mut blocked_handles = None;
+                    if !append {
+                        if let Ok(n) = api.notifications().await {
+                            unread = Some(n.unread);
+                        }
+                        if let Ok(d) = api.list_dms().await {
+                            unread_dms = Some(d.unread);
+                            let _ = tx.send(ClientEvent::DmListLoaded {
+                                items: d.conversations,
+                            });
+                        }
+                        if let Ok(h) = api.list_following().await {
+                            following_handles = Some(h);
+                        }
+                        if let Ok(h) = api.list_blocks().await {
+                            blocked_handles = Some(h);
+                        }
+                    }
+                    let next_cursor = resp.next_cursor;
+                    let _ = tx.send(ClientEvent::FeedLoaded {
+                        epoch,
+                        following,
+                        posts: resp.posts,
+                        append,
+                        next_cursor,
+                        unread,
+                        unread_dms,
+                        following_handles,
+                        blocked_handles,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(ClientEvent::Status(format!("refresh failed: {e:#}")));
+                    if append {
+                        let _ = tx.send(ClientEvent::FeedMoreFailed { epoch });
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) fn spawn_load_thread(&self, post_id: String) {
+        let api = self.api.clone();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            match api.get_thread(&post_id).await {
+                Ok(resp) => {
+                    let ordered = order_thread_dfs(&resp.posts, &resp.root.id);
+                    let _ = tx.send(ClientEvent::ThreadLoaded {
+                        focus_id: post_id,
+                        root_id: resp.root.id,
+                        posts: ordered,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(ClientEvent::Status(format!("thread: {e:#}")));
+                }
+            }
+        });
+    }
+
+    pub(crate) fn spawn_load_profile(&self, handle: String) {
+        let api = self.api.clone();
+        let tx = self.event_tx.clone();
+        let h = handle.clone();
+        tokio::spawn(async move {
+            let profile = api.get_profile(&h).await;
+            let posts = api.profile_posts(&h, None).await;
+            match (profile, posts) {
+                (Ok(profile), Ok(feed)) => {
+                    let _ = tx.send(ClientEvent::ProfileLoaded {
+                        profile,
+                        posts: feed.posts,
+                        append: false,
+                        next_cursor: feed.next_cursor,
+                    });
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    let _ = tx.send(ClientEvent::Status(format!("profile: {e:#}")));
+                }
+            }
+        });
+    }
+
+    pub(crate) fn maybe_load_more_profile(&mut self) {
+        let (handle, cursor, should) = if let Screen::Profile { state } = &self.screen {
+            if !state.has_more || state.posts.is_empty() {
+                return;
+            }
+            if state.selected + 3 < state.posts.len() {
+                return;
+            }
+            let cursor = state
+                .next_cursor
+                .clone()
+                .or_else(|| state.posts.last().map(|p| p.id.clone()));
+            let ready = cursor.is_some();
+            (state.profile.handle.clone(), cursor, ready)
+        } else {
+            return;
+        };
+        if !should {
+            return;
+        }
+        let Some(cursor) = cursor else { return };
+        self.pending_profile = Some(handle.to_ascii_lowercase());
+        let api = self.api.clone();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let profile = api.get_profile(&handle).await;
+            let posts = api.profile_posts(&handle, Some(&cursor)).await;
+            match (profile, posts) {
+                (Ok(profile), Ok(feed)) => {
+                    let _ = tx.send(ClientEvent::ProfileLoaded {
+                        profile,
+                        posts: feed.posts,
+                        append: true,
+                        next_cursor: feed.next_cursor,
+                    });
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    let _ = tx.send(ClientEvent::Status(format!("profile: {e:#}")));
+                }
+            }
+        });
+    }
+
+    pub(crate) fn spawn_load_notifications(&self) {
+        let api = self.api.clone();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            match api.notifications().await {
+                Ok(resp) => {
+                    let _ = api.mark_notifications_read().await;
+                    let _ = tx.send(ClientEvent::NotificationsLoaded {
+                        items: resp.notifications,
+                        unread: 0,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(ClientEvent::Status(format!("notifications: {e:#}")));
+                }
+            }
+        });
+    }
+
+    pub(crate) fn spawn_load_dm_list(&self) {
+        let api = self.api.clone();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            match api.list_dms().await {
+                Ok(resp) => {
+                    let _ = tx.send(ClientEvent::DmListLoaded {
+                        items: resp.conversations,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(ClientEvent::Status(format!("dms: {e:#}")));
+                }
+            }
+        });
+    }
+
+    pub(crate) fn spawn_load_dm_thread(&self, request_key: String, id: String) {
+        let api = self.api.clone();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            match api.get_dm(&id).await {
+                Ok(resp) => {
+                    let _ = tx.send(ClientEvent::DmThreadLoaded {
+                        request_key,
+                        conversation_id: resp.conversation.id,
+                        peer_handle: resp.conversation.peer_handle,
+                        messages: resp.messages,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(ClientEvent::Status(format!("dm: {e:#}")));
+                }
+            }
+        });
+    }
+
+    /// Placeholder profile used while network data is in flight.
+    pub(crate) fn stub_profile(handle: &str, is_me: bool) -> UserProfile {
+        UserProfile {
+            id: String::new(),
+            handle: handle.to_string(),
+            bio: None,
+            created_at: Utc::now(),
+            followers: 0,
+            following: 0,
+            posts: 0,
+            followed_by_me: false,
+            follows_me: false,
+            blocked_by_me: false,
+            is_me,
+        }
     }
 
     fn spawn_ws(&self) {

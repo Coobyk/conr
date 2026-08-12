@@ -21,15 +21,31 @@ pub struct Theme {
     pub dim: String,
 }
 
+impl Theme {
+    /// First-ship spec colors that older clients wrote and never applied.
+    pub fn is_legacy_spec(&self) -> bool {
+        fn eq(a: &str, b: &str) -> bool {
+            a.trim().eq_ignore_ascii_case(b)
+        }
+        eq(&self.background, "#1D1F21")
+            && eq(&self.foreground, "#C5C8C6")
+            && eq(&self.accent, "#81A2BE")
+            && eq(&self.error, "#CC6666")
+            && eq(&self.success, "#B5BD68")
+            && eq(&self.dim, "#5A5A5A")
+    }
+}
+
 impl Default for Theme {
     fn default() -> Self {
+        // Matches the shipped ink + violet chrome (see ui/theme.rs Palette::INK).
         Self {
-            background: "#1D1F21".into(),
-            foreground: "#C5C8C6".into(),
-            accent: "#81A2BE".into(),
-            error: "#CC6666".into(),
-            success: "#B5BD68".into(),
-            dim: "#5A5A5A".into(),
+            background: "#0a0a0f".into(),
+            foreground: "#f0eef6".into(),
+            accent: "#a78bfa".into(),
+            error: "#f87171".into(),
+            success: "#34d399".into(),
+            dim: "#8a869a".into(),
         }
     }
 }
@@ -69,7 +85,14 @@ impl Config {
             return Ok(cfg);
         }
         let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let cfg: Config = toml::from_str(&text).context("parse config.toml")?;
+        let mut cfg: Config = toml::from_str(&text).context("parse config.toml")?;
+        // Older clients wrote spec-v0.3 Tomorrow Night colors that the TUI
+        // never applied. Rewrite them to the real ink default so honoring
+        // theme does not surprise existing installs.
+        if cfg.theme.is_legacy_spec() {
+            cfg.theme = Theme::default();
+            let _ = cfg.save();
+        }
         Ok(cfg)
     }
 

@@ -8,6 +8,7 @@ mod keychain;
 mod phase_c;
 mod reminders;
 mod ui;
+mod view_cache;
 
 use anyhow::Context;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};

@@ -1,8 +1,8 @@
-# conr — Technical Specification v0.3
+# conr — Technical Specification v0.4
 
-**July 2026 · Rust-native · Privacy-first · Terminal-native Social Network**
+**August 2026 · Rust-native · Privacy-first · Terminal-native Social Network**
 
-Personal toy for a few close friends on a single public instance. Prefer shipping **auth + chronological posts** before threads, likes polish, or discovery.
+Personal toy for a few close friends on a single public instance. Phases A–C are shipped. Phase D finishes half-wired product (pagination, theme, unread DMs, spec/code match).
 
 ---
 
@@ -33,17 +33,18 @@ Primary terminal target: **Ghostty**, with graceful fallbacks.
 | Token reminders | Client-only: **next day**, **after 1 week**, then **monthly** (“do you still have your token?”) |
 | Backup | Optional encrypted local file; key from **user-chosen recovery passphrase** (not legal name / not card digits — see §5). Never sent to server |
 | Handles | **Case-insensitive**; stored and displayed **lowercase**. Fixed in v1 (no renames) |
-| Feed | Global chronological top-level posts |
+| Feed | Global chronological top-level posts + Following tab |
 | Post length | **512** characters max; **reject empty / whitespace-only** on server (and client) |
-| Edit posts | No |
-| Delete posts | **Not in first ship.** Later: **tombstone** one row, keep children, show `[Deleted]` |
-| Replies | **Planned multi-level, unbounded depth.** Not required for first ship — get posting working first |
-| Thread realtime | Later; reopen/refetch is fine initially |
-| Likes | Keep in near-term scope (still desired); implement after basic posting if needed |
-| Follows | **Skip** for now |
-| Search / FTS | **Skip** for now |
-| Tags table | **Skip** for now (hashtags may appear as plain text in content) |
-| Blocks / notifications | Skip |
+| Edit posts | Own posts only (`edited_at`); markup is client-rendered plain text |
+| Delete posts | **Tombstone** one row, keep children, show `[Deleted]` |
+| Replies | Multi-level, unbounded depth |
+| Thread realtime | WS `NewPost` / `PostEdited` / `PostDeleted`; refetch on open is also fine |
+| Likes | Toggle + count; WS `LikeUpdated` |
+| Follows | Follow / unfollow + Following feed |
+| Search / FTS | Postgres `tsvector` + `@user` / `#tag` |
+| Tags table | `tags` + `post_tags`, synced from `#hashtags` in content |
+| Blocks / notifications | Mutual hide + required block reason; notifs for like/reply/follow/mention |
+| DMs | 1:1 conversations; unread via `dm_reads` |
 | Spam / analytics | Skip |
 | Paths | **XDG only**: `~/.config/conr/`, `~/.local/share/conr/` |
 | Server URL | Client `~/.config/conr/config.toml` |
@@ -66,7 +67,7 @@ Primary terminal target: **Ghostty**, with graceful fallbacks.
 | Server | Axum 0.8 | Single binary |
 | DB | PostgreSQL 16 + sqlx 0.8 | Compile-time checked queries |
 | Auth hash | blake3 | Token hashing |
-| Auth session | JWT (Ed25519 via ring) + refresh tokens | |
+| Auth session | JWT **HS256** over `CONR_SIGNING_KEY` (32-byte seed, base64) + hashed refresh tokens | |
 | IDs | xid | Sortable public IDs |
 | Serde | serde_json | HTTP + WebSocket |
 
@@ -344,13 +345,26 @@ Minimum 80×24.
 
 | Key | Action |
 | --- | --- |
-| `j` / `k` | Scroll feed |
-| `n` | New post |
+| `j` / `k` | Scroll feed (loads the next page near the bottom) |
 | `g` / `G` | Top / bottom |
-| `q` | Quit |
+| `n` | New post |
+| `r` | Reply |
+| `e` | Edit own post / bio on own profile |
+| `Enter` | Open thread / result |
+| `Space` | Like / unlike |
+| `d` | Delete own post (tombstone) |
+| `Tab` | For you ↔ Following |
+| `/` | Search |
+| `i` | Notifications |
+| `m` | DMs |
+| `p` / `Shift+p` | Author profile / your profile |
+| `f` | Follow author |
+| `u` | Refresh |
 | `?` | Help |
-
-**Later keys:** `Enter` thread, `r` reply, `Space` like, richer `/` palette.
+| `q` | Quit |
+| `Shift+L` | Logout (keeps saved tokens) |
+| `Ctrl+S` | Submit compose / DM |
+| `Ctrl+B` / `U` / `T` / `Y` | Wrap bold / underline / strike / color |
 
 ### Composer
 
@@ -364,13 +378,15 @@ Minimum 80×24.
 server_url = "https://conr.example.com"  # or http://127.0.0.1:8080 for local
 
 [theme]
-background = "#1D1F21"
-foreground = "#C5C8C6"
-accent = "#81A2BE"
-error = "#CC6666"
-success = "#B5BD68"
-dim = "#5A5A5A"
+background = "#0a0a0f"
+foreground = "#f0eef6"
+accent     = "#a78bfa"
+error      = "#f87171"
+success    = "#34d399"
+dim        = "#8a869a"
 ```
+
+The client applies these six hex values to TUI chrome on launch and derives surfaces / selection from them. The previous Tomorrow Night defaults were never applied; existing files with those exact values are rewritten to the ink palette.
 
 ---
 
@@ -401,12 +417,21 @@ dim = "#5A5A5A"
 - Search (FTS posts, users, `#tags`)
 - Tags index (`post_tags`)
 - Edit posts (`edited_at`)
-- Blocks (mutual hide + unfollow)
+- Blocks (mutual hide + unfollow + required reason)
 - Notifications (like, reply, follow, mention)
 - DMs (1:1 conversations)
 - Profile + bio
 - Simple post rate limit (60/hour)
 - No binary images (URLs in text are fine); no analytics
+
+### Phase D — In progress (product completeness)
+
+- Client cursor pagination on feed + profile (`j` / `G` near the end)
+- `config.toml` theme actually colors the TUI
+- Unread DMs (`dm_reads`, badge next to `m`, per-row count)
+- Client markup (`**bold**` `__underline__` `~~strike~~` `{red}…{/}`) — stored as plain text
+- Bounded in-memory view cache; persist `liked_by_me` in SQLite
+- This spec matches the running binary (HS256 JWT, Phase C routes)
 
 ### Content rules (server-enforced)
 
@@ -465,7 +490,7 @@ Internet → Caddy or nginx (HTTPS, Let's Encrypt free cert)
 | Env | Description | Default |
 | --- | --- | --- |
 | `DATABASE_URL` | Postgres URL | required |
-| `CONR_SIGNING_KEY` | base64 Ed25519 seed for JWTs | required |
+| `CONR_SIGNING_KEY` | base64 of 32 bytes; HMAC-SHA256 secret for access JWTs | required in production; ephemeral in dev |
 | `CONR_PORT` | listen port | `8080` |
 | `CONR_MAX_CONNECTIONS` | WS cap | `1000` |
 
@@ -486,7 +511,8 @@ cargo run -p conr-client
 | **A — First ship** | Auth, token UX, feed, post, WS, cache, XDG config |
 | **B** (done) | Likes, multi-level replies, tombstone delete |
 | **C** (done) | Follows, search, tags, blocks, notifs, DMs, edit, profile |
-| later | Binary media, spam tooling, polish |
+| **D** | Pagination, theme, unread DMs, markup/cache polish, spec sync |
+| later | Binary media, spam tooling, rate-limit register/login, CI |
 
 ---
 
@@ -520,4 +546,4 @@ cargo run -p conr-client
 
 ---
 
-*conr v0.3 · Phase A = post + auth; threads later · avoid collecting real-world identity*
+*conr v0.4 · Phases A–C shipped · Phase D = finish the half-built product · avoid collecting real-world identity*

@@ -168,7 +168,8 @@ impl Api {
         let filter = if following { "following" } else { "all" };
         let mut url = format!("{}/feed?limit=50&filter={filter}", self.base);
         if let Some(c) = cursor {
-            url.push_str(&format!("&cursor={c}"));
+            url.push_str("&cursor=");
+            url.push_str(&urlencoding_lite(c));
         }
         let url = url;
         let resp = self
@@ -240,8 +241,17 @@ impl Api {
         Ok(resp.json().await?)
     }
 
-    pub async fn profile_posts(&self, handle: &str) -> Result<FeedResponse> {
-        let url = format!("{}/users/{handle}/posts?limit=50", self.base);
+    pub async fn profile_posts(
+        &self,
+        handle: &str,
+        cursor: Option<&str>,
+    ) -> Result<FeedResponse> {
+        let mut url = format!("{}/users/{handle}/posts?limit=50", self.base);
+        if let Some(c) = cursor {
+            url.push_str("&cursor=");
+            url.push_str(&urlencoding_lite(c));
+        }
+        let url = url;
         let resp = self
             .send_authed(|| self.client.get(&url), "profile posts")
             .await?;

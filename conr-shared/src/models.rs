@@ -204,6 +204,9 @@ pub struct DmConversation {
     pub peer_id: String,
     pub last_message: Option<String>,
     pub last_at: Option<DateTime<Utc>>,
+    /// Messages from the peer newer than this viewer's last read.
+    #[serde(default)]
+    pub unread: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +222,9 @@ pub struct DmMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DmListResponse {
     pub conversations: Vec<DmConversation>,
+    /// Sum of per-conversation `unread`.
+    #[serde(default)]
+    pub unread: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

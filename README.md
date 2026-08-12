@@ -41,7 +41,17 @@ Config is created at `~/.config/conr/config.toml`:
 
 ```toml
 server_url = "http://127.0.0.1:8080"
+
+[theme]
+background = "#0a0a0f"
+foreground = "#f0eef6"
+accent     = "#a78bfa"
+error      = "#f87171"
+success    = "#34d399"
+dim        = "#8a869a"
 ```
+
+Theme hex values are applied to the TUI chrome on launch. Surfaces and selection colors are derived from those six keys.
 
 Data (cache, backups, logs): `~/.local/share/conr/`.
 
@@ -59,8 +69,10 @@ Data (cache, backups, logs): `~/.local/share/conr/`.
 - Global chronological feed + **Following** tab (`Tab`)
 - Compose posts (512 chars), `#hashtags`, `@mentions`
 - Post markup: `**bold**`, `__underline__`, `~~strike~~`, `{red}color{/}`
+  - Composer styles in place as pairs close; `Ctrl+B`/`U`/`T` wrap; `{` color autocomplete
 - WebSocket live updates
-- Offline SQLite cache
+- Offline SQLite cache + in-memory view cache (pages switch instantly, refresh in background)
+- Cursor pagination on the feed and profile (j / G load older posts)
 
 ### Social (Phase B + C)
 
@@ -71,14 +83,15 @@ Data (cache, backups, logs): `~/.local/share/conr/`.
 - Blocks (`b` on profile)
 - Search posts / users / tags (`/`)
 - Notifications (`i`) — likes, replies, follows, mentions
-- Direct messages (`m`)
+- Direct messages (`m`) with unread badge
 - Light rate limit (60 posts / hour)
 
 ### Keys
 
 | Key | Action |
 | --- | --- |
-| `j` / `k` | Scroll |
+| `j` / `k` | Scroll (loads older posts near the bottom) |
+| `g` / `G` | Top / bottom of the current list |
 | `n` | New post |
 | `r` | Reply |
 | `e` | Edit own post / bio on profile |

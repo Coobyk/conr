@@ -9,53 +9,39 @@ use conr_shared::{format_token_block, POST_MAX_LEN};
 
 use crate::app::{post_depth, App, MenuEntry, ReturnTo, Screen, SettingsBack};
 use crate::phase_c::{FeedTab, SearchHit};
-
-// ── Palette (ink dark + violet) ─────────────────────────────────────────────
-
-const BG: Color = Color::Rgb(0x0a, 0x0a, 0x0f);
-const SURFACE: Color = Color::Rgb(0x14, 0x14, 0x1c);
-const SURFACE2: Color = Color::Rgb(0x1c, 0x1c, 0x28);
-const BORDER: Color = Color::Rgb(0x2a, 0x2a, 0x3a);
-const TEXT: Color = Color::Rgb(0xf0, 0xee, 0xf6);
-const MUTED: Color = Color::Rgb(0x8a, 0x86, 0x9a);
-const PURPLE: Color = Color::Rgb(0xa7, 0x8b, 0xfa);
-const PURPLE_DIM: Color = Color::Rgb(0x5b, 0x45, 0x8f);
-const PURPLE_HOT: Color = Color::Rgb(0xc4, 0xb5, 0xfd);
-const LIKE: Color = Color::Rgb(0xf4, 0x72, 0xb6);
-const RT: Color = Color::Rgb(0x34, 0xd3, 0x99);
-const ERR: Color = Color::Rgb(0xf8, 0x71, 0x71);
-const OK: Color = Color::Rgb(0x34, 0xd3, 0x99);
-const SELECT_BG: Color = Color::Rgb(0x1e, 0x1b, 0x2e);
-const AVATAR_BG: Color = Color::Rgb(0xa7, 0x8b, 0xfa);
-const BUBBLE_ME: Color = Color::Rgb(0x2e, 0x22, 0x4a);
-const BUBBLE_THEM: Color = Color::Rgb(0x1a, 0x1a, 0x24);
+use crate::ui::theme::{
+    avatar_bg as AVATAR_BG, bg as BG, border as BORDER, bubble_me as BUBBLE_ME,
+    bubble_them as BUBBLE_THEM, err as ERR, like as LIKE, muted as MUTED, ok as OK, purple as PURPLE,
+    purple_dim as PURPLE_DIM, purple_hot as PURPLE_HOT, rt as RT, select_bg as SELECT_BG,
+    surface as SURFACE, surface2 as SURFACE2, text as TEXT,
+};
 
 fn style_bg() -> Style {
-    Style::default().bg(BG).fg(TEXT)
+    Style::default().bg(BG()).fg(TEXT())
 }
 
 fn style_accent() -> Style {
-    Style::default().fg(PURPLE).add_modifier(Modifier::BOLD)
+    Style::default().fg(PURPLE()).add_modifier(Modifier::BOLD)
 }
 
 fn style_text() -> Style {
-    Style::default().fg(TEXT)
+    Style::default().fg(TEXT())
 }
 
 fn style_dim() -> Style {
-    Style::default().fg(MUTED)
+    Style::default().fg(MUTED())
 }
 
 fn style_err() -> Style {
-    Style::default().fg(ERR)
+    Style::default().fg(ERR())
 }
 
 fn style_ok() -> Style {
-    Style::default().fg(OK)
+    Style::default().fg(OK())
 }
 
 fn style_bold() -> Style {
-    Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+    Style::default().fg(TEXT()).add_modifier(Modifier::BOLD)
 }
 
 fn fill_bg(frame: &mut Frame, area: Rect) {
@@ -65,9 +51,9 @@ fn fill_bg(frame: &mut Frame, area: Rect) {
 fn card_block(title: &str) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER))
+        .border_style(Style::default().fg(BORDER()))
         .title(Span::styled(format!(" {title} "), style_accent()))
-        .style(Style::default().bg(SURFACE).fg(TEXT))
+        .style(Style::default().bg(SURFACE()).fg(TEXT()))
         .padding(Padding::new(1, 1, 0, 0))
 }
 
@@ -96,16 +82,16 @@ fn gradient_hairline(width: usize, phase: f32) -> Line<'static> {
         let t = (base * 1.2 + phase * 0.04).rem_euclid(1.0);
         let wave = (t * std::f32::consts::TAU).sin().abs();
         // Stay near border / dim purple — never hot.
-        let c = lerp_color(BORDER, PURPLE_DIM, 0.25 + 0.35 * wave);
+        let c = lerp_color(BORDER(), PURPLE_DIM(), 0.25 + 0.35 * wave);
         let ch = if i % 2 == 0 { "─" } else { " " };
-        spans.push(Span::styled(ch, Style::default().fg(c).bg(BG)));
+        spans.push(Span::styled(ch, Style::default().fg(c).bg(BG())));
     }
     Line::from(spans)
 }
 
 /// density: 0.0 sparse … 1.0 party (welcome / login).
 fn draw_sparkle_field(frame: &mut Frame, area: Rect, phase: f32, density: f32) {
-    draw_sparkle_field_on(frame, area, phase, density, BG);
+    draw_sparkle_field_on(frame, area, phase, density, BG());
 }
 
 fn draw_sparkle_field_on(frame: &mut Frame, area: Rect, phase: f32, density: f32, bg: Color) {
@@ -144,7 +130,7 @@ fn draw_sparkle_field_on(frame: &mut Frame, area: Rect, phase: f32, density: f32
                 3 => "·",
                 _ => "⋆",
             };
-            let c = lerp_color(PURPLE_DIM, PURPLE, 0.35 + 0.45 * twinkle);
+            let c = lerp_color(PURPLE_DIM(), PURPLE(), 0.35 + 0.45 * twinkle);
             let cell = Rect {
                 x: area.x + col,
                 y: area.y + row,
@@ -164,9 +150,9 @@ fn begin_popup(frame: &mut Frame, base: Rect, title: &str) -> Rect {
     frame.render_widget(Clear, base);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(PURPLE))
+        .border_style(Style::default().fg(PURPLE()))
         .title(Span::styled(format!(" {title} "), style_accent()))
-        .style(Style::default().bg(SURFACE).fg(TEXT))
+        .style(Style::default().bg(SURFACE()).fg(TEXT()))
         .padding(Padding::horizontal(1));
     let inner = block.inner(base);
     frame.render_widget(block, base);
@@ -176,6 +162,7 @@ fn begin_popup(frame: &mut Frame, base: Rect, title: &str) -> Rect {
 // ── Entry ───────────────────────────────────────────────────────────────────
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    crate::ui::theme::install(app.palette);
     let area = frame.area();
     fill_bg(frame, area);
 
@@ -242,6 +229,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             parent_id,
             edit_id,
             return_to,
+            color_ac_idx,
         } => {
             match return_to {
                 ReturnTo::Thread => draw_thread(frame, area, app),
@@ -254,7 +242,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
             } else {
                 ComposeMode::New
             };
-            draw_composer(frame, area, textarea, error.as_deref(), mode);
+            draw_composer(
+                frame,
+                area,
+                textarea,
+                error.as_deref(),
+                mode,
+                *color_ac_idx,
+            );
         }
         Screen::Search { state } => draw_search(frame, area, app, state),
         Screen::Profile { state } => draw_profile(frame, area, app, state),
@@ -354,8 +349,8 @@ fn draw_welcome_menu(frame: &mut Frame, area: Rect, app: &App, selected: usize) 
                 Span::styled(
                     label,
                     Style::default()
-                        .fg(TEXT)
-                        .bg(SELECT_BG)
+                        .fg(TEXT())
+                        .bg(SELECT_BG())
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
@@ -396,7 +391,7 @@ fn draw_welcome_menu(frame: &mut Frame, area: Rect, app: &App, selected: usize) 
     frame.render_widget(
         Paragraph::new(all)
             .alignment(Alignment::Left)
-            .style(Style::default().bg(SURFACE).fg(TEXT)),
+            .style(Style::default().bg(SURFACE()).fg(TEXT())),
         popup,
     );
 }
@@ -486,7 +481,7 @@ fn draw_token_block(frame: &mut Frame, area: Rect, token: &str, export_status: &
     for line in block_text.lines() {
         lines.push(Line::from(Span::styled(
             format!("    {line}"),
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT()).add_modifier(Modifier::BOLD),
         )));
     }
     lines.push(Line::from(""));
@@ -700,16 +695,16 @@ fn draw_settings(
 
     let url_style = if focus == 0 {
         Style::default()
-            .fg(TEXT)
-            .bg(SELECT_BG)
+            .fg(TEXT())
+            .bg(SELECT_BG())
             .add_modifier(Modifier::BOLD)
     } else {
         style_text()
     };
     let auto_style = if focus == 1 {
         Style::default()
-            .fg(TEXT)
-            .bg(SELECT_BG)
+            .fg(TEXT())
+            .bg(SELECT_BG())
             .add_modifier(Modifier::BOLD)
     } else {
         style_text()
@@ -756,7 +751,7 @@ fn draw_settings(
     frame.render_widget(
         Paragraph::new(lines)
             .alignment(Alignment::Left)
-            .style(Style::default().bg(SURFACE).fg(TEXT)),
+            .style(Style::default().bg(SURFACE()).fg(TEXT())),
         popup,
     );
 }
@@ -796,8 +791,8 @@ fn draw_feed(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App, active: &str) {
     let block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(SURFACE).fg(TEXT));
+        .border_style(Style::default().fg(BORDER()))
+        .style(Style::default().bg(SURFACE()).fg(TEXT()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -812,12 +807,17 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App, active: &str) {
     } else {
         "  Notifs".into()
     };
+    let messages = if app.unread_dms > 0 {
+        format!("  Messages {}", app.unread_dms)
+    } else {
+        "  Messages".into()
+    };
 
     let items: [(&str, &str); 6] = [
         ("home", "  Home"),
         ("search", "  Search"),
         ("notifs", &notif),
-        ("messages", "  Messages"),
+        ("messages", &messages),
         ("profile", "  Profile"),
         ("post", "  Post"),
     ];
@@ -838,18 +838,18 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App, active: &str) {
         };
         let style = if selected {
             Style::default()
-                .fg(TEXT)
-                .bg(SELECT_BG)
+                .fg(TEXT())
+                .bg(SELECT_BG())
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(TEXT).bg(SURFACE)
+            Style::default().fg(TEXT()).bg(SURFACE())
         };
         let pulse = ((app.ui_secs() * 2.8).sin() + 1.0) * 0.5;
         let marker = if selected {
-            let c = lerp_color(PURPLE, PURPLE_HOT, pulse);
-            Span::styled("▌", Style::default().fg(c).bg(SELECT_BG))
+            let c = lerp_color(PURPLE(), PURPLE_HOT(), pulse);
+            Span::styled("▌", Style::default().fg(c).bg(SELECT_BG()))
         } else {
-            Span::styled(" ", Style::default().bg(SURFACE))
+            Span::styled(" ", Style::default().bg(SURFACE()))
         };
         lines.push(Line::from(vec![marker, Span::styled(row, style)]));
     }
@@ -862,7 +862,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App, active: &str) {
     // Breathing live indicator.
     let live_line = if app.ws_connected {
         let pulse = ((app.ui_secs() * 2.4).sin() + 1.0) * 0.5;
-        let c = lerp_color(OK, PURPLE_HOT, pulse * 0.55);
+        let c = lerp_color(OK(), PURPLE_HOT(), pulse * 0.55);
         Line::from(vec![
             Span::styled("  ● ", Style::default().fg(c)),
             Span::styled("live", Style::default().fg(c).add_modifier(Modifier::BOLD)),
@@ -886,7 +886,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App, active: &str) {
             width: inner.width,
             height: inner.height - content_rows,
         };
-        draw_sparkle_field_on(frame, sparkle, app.ui_secs(), 0.75, SURFACE);
+        draw_sparkle_field_on(frame, sparkle, app.ui_secs(), 0.75, SURFACE());
     }
 }
 
@@ -914,7 +914,7 @@ fn conr_logo_lines(wave_t: Option<f32>) -> Vec<Line<'static>> {
 
 fn logo_char_style(wave_t: Option<f32>, row: usize, col: usize) -> Style {
     // Resting look: bold purple.
-    let bold_accent = Style::default().fg(PURPLE).add_modifier(Modifier::BOLD);
+    let bold_accent = Style::default().fg(PURPLE()).add_modifier(Modifier::BOLD);
     let Some(t) = wave_t else {
         return bold_accent;
     };
@@ -935,10 +935,10 @@ fn logo_char_style(wave_t: Option<f32>, row: usize, col: usize) -> Style {
 
     if intensity > 0.35 {
         // Crest — regular weight + slightly dimmer so the unbold reads clearly.
-        Style::default().fg(PURPLE_DIM)
+        Style::default().fg(PURPLE_DIM())
     } else if intensity > 0.08 {
         // Soft edge — regular weight, full purple.
-        Style::default().fg(PURPLE)
+        Style::default().fg(PURPLE())
     } else {
         // Outside the wave — stay bold.
         bold_accent
@@ -953,7 +953,7 @@ fn draw_timeline(frame: &mut Frame, area: Rect, app: &App) {
 
     let header_block = Block::default()
         .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(BORDER))
+        .border_style(Style::default().fg(BORDER()))
         .style(style_bg());
     let header_inner = header_block.inner(chunks[0]);
     frame.render_widget(header_block, chunks[0]);
@@ -961,12 +961,12 @@ fn draw_timeline(frame: &mut Frame, area: Rect, app: &App) {
     let phase = app.ui_secs();
     let (you_style, fol_style) = match app.feed_tab {
         FeedTab::All => (
-            Style::default().fg(PURPLE_HOT).add_modifier(Modifier::BOLD),
+            Style::default().fg(PURPLE_HOT()).add_modifier(Modifier::BOLD),
             style_dim(),
         ),
         FeedTab::Following => (
             style_dim(),
-            Style::default().fg(PURPLE_HOT).add_modifier(Modifier::BOLD),
+            Style::default().fg(PURPLE_HOT()).add_modifier(Modifier::BOLD),
         ),
     };
     let header_lines = vec![
@@ -1001,7 +1001,7 @@ fn draw_thread(frame: &mut Frame, area: Rect, app: &App) {
 
     let header_block = Block::default()
         .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(BORDER))
+        .border_style(Style::default().fg(BORDER()))
         .style(style_bg());
     let header_inner = header_block.inner(chunks[0]);
     frame.render_widget(header_block, chunks[0]);
@@ -1043,7 +1043,7 @@ fn build_thread_lines(
         let depth = post_depth(posts, p);
         let indent = "  ".repeat(depth.min(12));
         let selected_row = i == selected;
-        let row_bg = if selected_row { SELECT_BG } else { BG };
+        let row_bg = if selected_row { SELECT_BG() } else { BG() };
         let content_width = width.saturating_sub(4 + indent.chars().count() * 2).max(12);
 
         lines.push(Line::from(Span::styled(
@@ -1051,7 +1051,7 @@ fn build_thread_lines(
                 "{indent}{}",
                 "─".repeat(width.saturating_sub(indent.len()).min(120))
             ),
-            Style::default().fg(BORDER).bg(row_bg),
+            Style::default().fg(BORDER()).bg(row_bg),
         )));
 
         let avatar = avatar_glyph(&p.author_handle);
@@ -1062,29 +1062,29 @@ fn build_thread_lines(
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{indent}{marker}"),
-                Style::default().fg(MUTED).bg(row_bg),
+                Style::default().fg(MUTED()).bg(row_bg),
             ),
             Span::styled(
                 format!(" {avatar} "),
                 Style::default()
                     .fg(Color::Black)
-                    .bg(AVATAR_BG)
+                    .bg(AVATAR_BG())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" @{handle}"),
                 Style::default()
-                    .fg(TEXT)
+                    .fg(TEXT())
                     .bg(row_bg)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" · {time}"), Style::default().fg(MUTED).bg(row_bg)),
+            Span::styled(format!(" · {time}"), Style::default().fg(MUTED()).bg(row_bg)),
         ]));
 
         let body = p.display_content();
         if p.deleted_at.is_some() {
             let body_style = Style::default()
-                .fg(MUTED)
+                .fg(MUTED())
                 .bg(row_bg)
                 .add_modifier(Modifier::ITALIC);
             for wrap_line in wrap_text(body, content_width) {
@@ -1096,12 +1096,12 @@ fn build_thread_lines(
         } else {
             let prefix = Span::styled(
                 format!("{indent}    "),
-                Style::default().fg(TEXT).bg(row_bg),
+                Style::default().fg(TEXT()).bg(row_bg),
             );
             lines.extend(crate::ui::markup::styled_body_lines_prefixed(
                 body,
                 content_width,
-                TEXT,
+                TEXT(),
                 row_bg,
                 prefix,
             ));
@@ -1113,18 +1113,18 @@ fn build_thread_lines(
             format!("♡ {}", p.like_count)
         };
         let like_style = if p.liked_by_me {
-            Style::default().fg(LIKE).bg(row_bg)
+            Style::default().fg(LIKE()).bg(row_bg)
         } else {
-            Style::default().fg(MUTED).bg(row_bg)
+            Style::default().fg(MUTED()).bg(row_bg)
         };
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{indent}    ↩ {}  ", p.reply_count),
-                Style::default().fg(MUTED).bg(row_bg),
+                Style::default().fg(MUTED()).bg(row_bg),
             ),
             Span::styled(like_label, like_style),
             if selected_row {
-                Span::styled("  · selected", Style::default().fg(PURPLE).bg(row_bg))
+                Span::styled("  · selected", Style::default().fg(PURPLE()).bg(row_bg))
             } else {
                 Span::styled("", Style::default().bg(row_bg))
             },
@@ -1151,7 +1151,7 @@ fn build_feed_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  n  write a post",
-            Style::default().fg(PURPLE),
+            Style::default().fg(PURPLE()),
         )));
         lines.push(Line::from(Span::styled(
             "  /  find people  ·  Tab  following only",
@@ -1162,17 +1162,17 @@ fn build_feed_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
     let phase = app.ui_secs();
     let sel_pulse = ((phase * 2.6).sin() + 1.0) * 0.5;
-    let sel_bar = lerp_color(PURPLE, PURPLE_HOT, sel_pulse);
+    let sel_bar = lerp_color(PURPLE(), PURPLE_HOT(), sel_pulse);
 
     let start = app.feed_scroll.min(app.posts.len().saturating_sub(1));
     for (i, p) in app.posts.iter().enumerate().skip(start) {
         let selected = i == app.selected;
-        let row_bg = if selected { SELECT_BG } else { BG };
+        let row_bg = if selected { SELECT_BG() } else { BG() };
         let gutter = if selected { "▌" } else { " " };
         let gutter_style = if selected {
             Style::default().fg(sel_bar).bg(row_bg)
         } else {
-            Style::default().fg(BORDER).bg(row_bg)
+            Style::default().fg(BORDER()).bg(row_bg)
         };
 
         // Divider
@@ -1180,7 +1180,7 @@ fn build_feed_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             Span::styled(gutter, gutter_style),
             Span::styled(
                 "─".repeat(width.saturating_sub(1).min(199)),
-                Style::default().fg(BORDER).bg(row_bg),
+                Style::default().fg(BORDER()).bg(row_bg),
             ),
         ]));
 
@@ -1195,19 +1195,19 @@ fn build_feed_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 format!(" {avatar} "),
                 Style::default()
                     .fg(Color::Black)
-                    .bg(AVATAR_BG)
+                    .bg(AVATAR_BG())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" @{handle}"),
                 Style::default()
-                    .fg(TEXT)
+                    .fg(TEXT())
                     .bg(row_bg)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" · {time}"), Style::default().fg(MUTED).bg(row_bg)),
+            Span::styled(format!(" · {time}"), Style::default().fg(MUTED()).bg(row_bg)),
             if p.edited_at.is_some() {
-                Span::styled(" · edited", Style::default().fg(MUTED).bg(row_bg))
+                Span::styled(" · edited", Style::default().fg(MUTED()).bg(row_bg))
             } else {
                 Span::styled("", Style::default().bg(row_bg))
             },
@@ -1217,7 +1217,7 @@ fn build_feed_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         let body = p.display_content();
         if p.deleted_at.is_some() {
             let body_style = Style::default()
-                .fg(MUTED)
+                .fg(MUTED())
                 .bg(row_bg)
                 .add_modifier(Modifier::ITALIC);
             for wrap_line in wrap_text(body, content_width) {
@@ -1230,9 +1230,9 @@ fn build_feed_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             let mut body_lines = crate::ui::markup::styled_body_lines_prefixed(
                 body,
                 content_width,
-                TEXT,
+                TEXT(),
                 row_bg,
-                Span::styled("   ", Style::default().fg(TEXT).bg(row_bg)),
+                Span::styled("   ", Style::default().fg(TEXT()).bg(row_bg)),
             );
             for bl in &mut body_lines {
                 let mut spans = vec![Span::styled(gutter, gutter_style)];
@@ -1243,14 +1243,14 @@ fn build_feed_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         }
 
         // Action row with live counts
-        let action_style = Style::default().fg(MUTED).bg(row_bg);
+        let action_style = Style::default().fg(MUTED()).bg(row_bg);
         let like_label = if p.liked_by_me {
             format!("♥ {}", p.like_count)
         } else {
             format!("♡ {}", p.like_count)
         };
         let like_style = if p.liked_by_me || selected {
-            Style::default().fg(LIKE).bg(row_bg)
+            Style::default().fg(LIKE()).bg(row_bg)
         } else {
             action_style
         };
@@ -1269,7 +1269,7 @@ fn build_feed_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             Span::styled(
                 "↗",
                 Style::default()
-                    .fg(if selected { RT } else { MUTED })
+                    .fg(if selected { RT() } else { MUTED() })
                     .bg(row_bg),
             ),
             sel_hint,
@@ -1352,8 +1352,8 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
 fn draw_right_rail(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::LEFT)
-        .border_style(Style::default().fg(BORDER))
-        .style(Style::default().bg(SURFACE).fg(TEXT));
+        .border_style(Style::default().fg(BORDER()))
+        .style(Style::default().bg(SURFACE()).fg(TEXT()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1405,13 +1405,14 @@ fn draw_composer(
     textarea: &tui_textarea::TextArea,
     error: Option<&str>,
     mode: ComposeMode,
+    color_ac_idx: usize,
 ) {
     let (title, prompt) = match mode {
         ComposeMode::New => ("Post", "What's happening?"),
         ComposeMode::Reply => ("Reply", "Post your reply"),
         ComposeMode::Edit => ("Edit", "Edit your post"),
     };
-    let inner = begin_popup(frame, centered_rect(70, 48, area), title);
+    let inner = begin_popup(frame, centered_rect(72, 55, area), title);
 
     let content = textarea.lines().join("\n");
     let count = content.chars().count();
@@ -1424,29 +1425,94 @@ fn draw_composer(
         style_dim()
     };
 
+    let color_q = crate::ui::compose_edit::active_color_query(textarea);
+    let color_suggestions = color_q
+        .as_ref()
+        .map(|q| crate::ui::markup::filter_colors(&q.prefix))
+        .unwrap_or_default();
+    let ac_rows = if color_suggestions.is_empty() {
+        0u16
+    } else {
+        1
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(3),
+            Constraint::Length(1),       // prompt
+            Constraint::Min(5),          // in-place styled editor
+            Constraint::Length(ac_rows), // color autocomplete
+            Constraint::Length(3),       // footer
         ])
         .split(inner);
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(prompt, style_dim())))
-            .style(Style::default().bg(SURFACE)),
+            .style(Style::default().bg(SURFACE())),
         chunks[0],
     );
 
-    let mut ta = textarea.clone();
-    ta.set_style(Style::default().fg(TEXT).bg(SURFACE));
-    ta.set_cursor_style(Style::default().bg(PURPLE).fg(Color::Black));
-    frame.render_widget(&ta, chunks[1]);
+    // Single editing surface: markup styles apply in place (markers stay dim).
+    let cursor = crate::ui::compose_edit::cursor_char_offset(textarea);
+    let selection = textarea.selection_range().map(|(start, end)| {
+        let lines: Vec<String> = textarea.lines().to_vec();
+        let s = rowcol_to_char_offset(&lines, start.0, start.1);
+        let e = rowcol_to_char_offset(&lines, end.0, end.1);
+        (s, e)
+    });
+
+    let edit_w = chunks[1].width.saturating_sub(2) as usize;
+    let edit_lines = crate::ui::markup::editor_lines(
+        &content,
+        edit_w.max(8),
+        TEXT(),
+        SURFACE(),
+        cursor,
+        selection,
+    );
+    // Left pad
+    let edit_lines: Vec<Line> = edit_lines
+        .into_iter()
+        .map(|mut line| {
+            let mut spans = vec![Span::styled(" ", Style::default().bg(SURFACE()))];
+            spans.extend(line.spans.drain(..));
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(edit_lines).style(Style::default().bg(SURFACE()).fg(TEXT())),
+        chunks[1],
+    );
+
+    if !color_suggestions.is_empty() {
+        let sel = color_ac_idx.min(color_suggestions.len() - 1);
+        let mut spans = vec![Span::styled("  color ", style_dim())];
+        for (i, name) in color_suggestions.iter().enumerate() {
+            let c = crate::ui::markup::ColorName::parse(name)
+                .map(|n| n.color())
+                .unwrap_or(TEXT());
+            if i == sel {
+                spans.push(Span::styled(
+                    format!(" {name} "),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(c)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(format!(" {name} "), Style::default().fg(c)));
+            }
+        }
+        spans.push(Span::styled("  Tab/↵", style_dim()));
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(SURFACE())),
+            chunks[2],
+        );
+    }
 
     let mut foot = vec![
         Line::from(Span::styled(
-            "**bold**  __under__  ~~strike~~  {red}color{/}",
+            "Ctrl+B bold  Ctrl+U under  Ctrl+T strike  Ctrl+Y color  ·  type { for colors",
             style_dim(),
         )),
         Line::from(vec![
@@ -1459,9 +1525,20 @@ fn draw_composer(
         foot.insert(0, Line::from(Span::styled(e, style_err())));
     }
     frame.render_widget(
-        Paragraph::new(foot).style(Style::default().bg(SURFACE)),
-        chunks[2],
+        Paragraph::new(foot).style(Style::default().bg(SURFACE())),
+        chunks[3],
     );
+}
+
+/// Convert TextArea (row, col) to a character offset in `lines().join("\n")`.
+fn rowcol_to_char_offset(lines: &[String], row: usize, col: usize) -> usize {
+    let mut off = 0usize;
+    let row = row.min(lines.len().saturating_sub(1));
+    for r in 0..row {
+        off += lines[r].chars().count() + 1;
+    }
+    let line_len = lines.get(row).map(|l| l.chars().count()).unwrap_or(0);
+    off + col.min(line_len)
 }
 
 // ── Overlays ────────────────────────────────────────────────────────────────
@@ -1475,6 +1552,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("  j/k  n r e ␣ ⏎ d  ", style_accent()),
             Span::styled("scroll/post/reply/edit/like/thread/del", style_text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  g / G           ", style_accent()),
+            Span::styled("top / bottom (loads older posts)", style_text()),
         ]),
         Line::from(vec![
             Span::styled("  Tab             ", style_accent()),
@@ -1507,31 +1588,39 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(Span::styled("  Post markup", style_dim())),
         Line::from(vec![
             Span::styled("  **bold**        ", style_accent()),
-            Span::styled("bold text", style_text()),
+            Span::styled("bold  ·  Ctrl+B (selection or insert)", style_text()),
         ]),
         Line::from(vec![
             Span::styled("  __underline__   ", style_accent()),
-            Span::styled("underlined", style_text()),
+            Span::styled("underline  ·  Ctrl+U", style_text()),
         ]),
         Line::from(vec![
             Span::styled("  ~~strike~~      ", style_accent()),
-            Span::styled("strikethrough", style_text()),
+            Span::styled("strikethrough  ·  Ctrl+T", style_text()),
         ]),
         Line::from(vec![
             Span::styled("  {red}hi{/}      ", style_accent()),
-            Span::styled("named color (also green, blue, …)", style_text()),
+            Span::styled("color  ·  Ctrl+Y or type {  ·  Tab complete", style_text()),
         ]),
         Line::from(vec![
             Span::styled("  @name  #tag    ", style_accent()),
-            Span::styled("auto-highlighted", style_text()),
+            Span::styled("auto-highlighted in feed + preview", style_text()),
         ]),
+        Line::from(Span::styled(
+            "  colors: red green blue yellow orange pink purple cyan white gray muted",
+            style_dim(),
+        )),
+        Line::from(Span::styled(
+            "  Styles apply in the composer as soon as a pair closes.",
+            style_dim(),
+        )),
         Line::from(Span::styled(
             "  Escape specials with \\  ·  Esc close",
             style_dim(),
         )),
     ];
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(SURFACE).fg(TEXT)),
+        Paragraph::new(lines).style(Style::default().bg(SURFACE()).fg(TEXT())),
         popup,
     );
 }
@@ -1555,9 +1644,9 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c:
         format!("  {}", state.query) + cursor
     };
     let box_style = if state.editing {
-        Style::default().fg(PURPLE)
+        Style::default().fg(PURPLE())
     } else {
-        Style::default().fg(BORDER)
+        Style::default().fg(BORDER())
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -1579,7 +1668,7 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c:
     }
     for (i, hit) in state.hits.iter().enumerate() {
         let sel = !state.editing && i == state.selected;
-        let bg = if sel { SELECT_BG } else { BG };
+        let bg = if sel { SELECT_BG() } else { BG() };
         let (kind, body) = match hit {
             SearchHit::Post(p) => (
                 "post",
@@ -1598,14 +1687,14 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c:
             ),
             SearchHit::Tag(n, c) => ("tag", format!("#{n}  · {c} posts")),
         };
-        let kind_style = Style::default().fg(PURPLE).bg(bg);
+        let kind_style = Style::default().fg(PURPLE()).bg(bg);
         let body_style = if sel {
             Style::default()
-                .fg(TEXT)
+                .fg(TEXT())
                 .bg(bg)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(TEXT).bg(bg)
+            Style::default().fg(TEXT()).bg(bg)
         };
         let trunc: String = body
             .chars()
@@ -1664,7 +1753,7 @@ fn draw_profile(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c
                 format!(" {avatar} "),
                 Style::default()
                     .fg(Color::Black)
-                    .bg(AVATAR_BG)
+                    .bg(AVATAR_BG())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("  @{}", p.handle), style_bold()),
@@ -1682,14 +1771,14 @@ fn draw_profile(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c
         )),
         Line::from(Span::styled(
             format!("    {actions}"),
-            Style::default().fg(PURPLE),
+            Style::default().fg(PURPLE()),
         )),
     ];
     frame.render_widget(
         Paragraph::new(header).block(
             Block::default()
                 .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(BORDER))
+                .border_style(Style::default().fg(BORDER()))
                 .style(style_bg()),
         ),
         chunks[0],
@@ -1701,7 +1790,7 @@ fn draw_profile(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c
     } else {
         for (i, post) in state.posts.iter().enumerate() {
             let sel = i == state.selected;
-            let bg = if sel { SELECT_BG } else { BG };
+            let bg = if sel { SELECT_BG() } else { BG() };
             lines.push(Line::from(Span::styled(
                 format!(
                     "  {} · {}",
@@ -1712,22 +1801,22 @@ fn draw_profile(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c
                         ""
                     }
                 ),
-                Style::default().fg(MUTED).bg(bg),
+                Style::default().fg(MUTED()).bg(bg),
             )));
             if post.deleted_at.is_some() {
                 let body: String = post.display_content().chars().take(90).collect();
                 lines.push(Line::from(Span::styled(
                     format!("  {body}"),
-                    Style::default().fg(MUTED).bg(bg),
+                    Style::default().fg(MUTED()).bg(bg),
                 )));
             } else if post.display_content().chars().count() <= 90 {
                 let preview_w = (main.width as usize).saturating_sub(4).max(20);
                 let body_lines = crate::ui::markup::styled_body_lines_prefixed(
                     post.display_content(),
                     preview_w,
-                    TEXT,
+                    TEXT(),
                     bg,
-                    Span::styled("  ", Style::default().fg(TEXT).bg(bg)),
+                    Span::styled("  ", Style::default().fg(TEXT()).bg(bg)),
                 );
                 if let Some(first) = body_lines.into_iter().next() {
                     lines.push(first);
@@ -1739,12 +1828,12 @@ fn draw_profile(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c
                     .collect();
                 lines.push(Line::from(Span::styled(
                     format!("  {body}"),
-                    Style::default().fg(TEXT).bg(bg),
+                    Style::default().fg(TEXT()).bg(bg),
                 )));
             }
             lines.push(Line::from(Span::styled(
                 format!("  ↩ {}   ♡ {}", post.reply_count, post.like_count),
-                Style::default().fg(MUTED).bg(bg),
+                Style::default().fg(MUTED()).bg(bg),
             )));
             lines.push(Line::from(Span::styled(" ", Style::default().bg(bg))));
         }
@@ -1774,7 +1863,7 @@ fn draw_notifications(
         .block(
             Block::default()
                 .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(BORDER))
+                .border_style(Style::default().fg(BORDER()))
                 .style(style_bg()),
         ),
         chunks[0],
@@ -1790,7 +1879,7 @@ fn draw_notifications(
     }
     for (i, n) in state.items.iter().enumerate() {
         let sel = i == state.selected;
-        let bg = if sel { SELECT_BG } else { BG };
+        let bg = if sel { SELECT_BG() } else { BG() };
         let (icon, text) = match n.kind.as_str() {
             "like" => ("♡", format!("@{} liked your post", n.actor_handle)),
             "reply" => ("↩", format!("@{} replied to you", n.actor_handle)),
@@ -1799,17 +1888,17 @@ fn draw_notifications(
             other => ("·", format!("@{} · {other}", n.actor_handle)),
         };
         let icon_col = match n.kind.as_str() {
-            "like" => LIKE,
-            "follow" => OK,
-            "mention" => PURPLE,
-            _ => MUTED,
+            "like" => LIKE(),
+            "follow" => OK(),
+            "mention" => PURPLE(),
+            _ => MUTED(),
         };
         lines.push(Line::from(vec![
             Span::styled(format!("  {icon}  "), Style::default().fg(icon_col).bg(bg)),
-            Span::styled(text, Style::default().fg(TEXT).bg(bg)),
+            Span::styled(text, Style::default().fg(TEXT()).bg(bg)),
             Span::styled(
                 format!("  {}", relative_time(n.created_at)),
-                Style::default().fg(MUTED).bg(bg),
+                Style::default().fg(MUTED()).bg(bg),
             ),
         ]));
     }
@@ -1836,7 +1925,7 @@ fn draw_dm_list(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c
         .block(
             Block::default()
                 .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(BORDER))
+                .border_style(Style::default().fg(BORDER()))
                 .style(style_bg()),
         ),
         chunks[0],
@@ -1856,12 +1945,12 @@ fn draw_dm_list(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  Or open a profile (p) and press m.",
-            Style::default().fg(PURPLE),
+            Style::default().fg(PURPLE()),
         )));
     }
     for (i, c) in state.items.iter().enumerate() {
         let sel = i == state.selected;
-        let bg = if sel { SELECT_BG } else { BG };
+        let bg = if sel { SELECT_BG() } else { BG() };
         let preview = c
             .last_message
             .as_deref()
@@ -1877,20 +1966,28 @@ fn draw_dm_list(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c
                 format!(" {av} "),
                 Style::default()
                     .fg(Color::Black)
-                    .bg(if sel { PURPLE } else { PURPLE_DIM }),
+                    .bg(if sel { PURPLE() } else { PURPLE_DIM() }),
             ),
             Span::styled(
                 format!(" @{}", c.peer_handle),
                 Style::default()
-                    .fg(TEXT)
+                    .fg(TEXT())
                     .bg(bg)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("  {time}"), Style::default().fg(MUTED).bg(bg)),
+            Span::styled(
+                if c.unread > 0 {
+                    format!("  · {}", c.unread)
+                } else {
+                    String::new()
+                },
+                Style::default().fg(PURPLE()).bg(bg).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {time}"), Style::default().fg(MUTED()).bg(bg)),
         ]));
         lines.push(Line::from(Span::styled(
             format!("     {preview}"),
-            Style::default().fg(MUTED).bg(bg),
+            Style::default().fg(MUTED()).bg(bg),
         )));
         lines.push(Line::from(Span::styled(" ", Style::default().bg(bg))));
     }
@@ -1923,8 +2020,8 @@ fn draw_dm_new(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase_c:
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(PURPLE))
-                .style(Style::default().bg(SURFACE).fg(TEXT))
+                .border_style(Style::default().fg(PURPLE()))
+                .style(Style::default().bg(SURFACE()).fg(TEXT()))
                 .padding(Padding::new(1, 1, 0, 0)),
         ),
         popup,
@@ -1963,7 +2060,7 @@ fn draw_dm_thread(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase
         .block(
             Block::default()
                 .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(BORDER))
+                .border_style(Style::default().fg(BORDER()))
                 .style(style_bg()),
         ),
         chunks[0],
@@ -1991,8 +2088,8 @@ fn draw_dm_thread(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase
             let body_lines = crate::ui::markup::styled_body_lines(
                 &m.content,
                 bubble_w,
-                TEXT,
-                if mine { BUBBLE_ME } else { BUBBLE_THEM },
+                TEXT(),
+                if mine { BUBBLE_ME() } else { BUBBLE_THEM() },
             );
 
             if mine {
@@ -2011,21 +2108,21 @@ fn draw_dm_thread(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase
                     let pad = (chunks[1].width as usize).saturating_sub(bubble_inner);
                     let mut spans = vec![Span::styled(
                         " ".repeat(pad),
-                        Style::default().bg(BG),
+                        Style::default().bg(BG()),
                     )];
                     spans.push(Span::styled(
                         "  ",
-                        Style::default().fg(TEXT).bg(BUBBLE_ME),
+                        Style::default().fg(TEXT()).bg(BUBBLE_ME()),
                     ));
                     for s in &bl.spans {
                         spans.push(Span::styled(
                             s.content.to_string(),
-                            s.style.bg(BUBBLE_ME),
+                            s.style.bg(BUBBLE_ME()),
                         ));
                     }
                     spans.push(Span::styled(
                         "  ",
-                        Style::default().fg(TEXT).bg(BUBBLE_ME),
+                        Style::default().fg(TEXT()).bg(BUBBLE_ME()),
                     ));
                     lines.push(Line::from(spans));
                 }
@@ -2037,17 +2134,17 @@ fn draw_dm_thread(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase
                 for bl in &body_lines {
                     let mut spans = vec![Span::styled(
                         "  ",
-                        Style::default().fg(TEXT).bg(BUBBLE_THEM),
+                        Style::default().fg(TEXT()).bg(BUBBLE_THEM()),
                     )];
                     for s in &bl.spans {
                         spans.push(Span::styled(
                             s.content.to_string(),
-                            s.style.bg(BUBBLE_THEM),
+                            s.style.bg(BUBBLE_THEM()),
                         ));
                     }
                     spans.push(Span::styled(
                         "  ",
-                        Style::default().fg(TEXT).bg(BUBBLE_THEM),
+                        Style::default().fg(TEXT()).bg(BUBBLE_THEM()),
                     ));
                     lines.push(Line::from(spans));
                 }
@@ -2060,8 +2157,8 @@ fn draw_dm_thread(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase
     // Composer
     let count = state.draft.lines().join("\n").chars().count();
     let mut ta = state.draft.clone();
-    ta.set_style(Style::default().fg(TEXT).bg(SURFACE2));
-    ta.set_cursor_style(Style::default().bg(PURPLE).fg(Color::Black));
+    ta.set_style(Style::default().fg(TEXT()).bg(SURFACE2()));
+    ta.set_cursor_style(Style::default().bg(PURPLE()).fg(Color::Black));
     let composer_title = if let Some(e) = &state.error {
         format!(" error · {e} ")
     } else {
@@ -2070,9 +2167,9 @@ fn draw_dm_thread(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if state.error.is_some() {
-            ERR
+            ERR()
         } else {
-            PURPLE
+            PURPLE()
         }))
         .title(Span::styled(
             composer_title,
@@ -2082,7 +2179,7 @@ fn draw_dm_thread(frame: &mut Frame, area: Rect, app: &App, state: &crate::phase
                 style_accent()
             },
         ))
-        .style(Style::default().bg(SURFACE2));
+        .style(Style::default().bg(SURFACE2()));
     let inner = block.inner(chunks[2]);
     frame.render_widget(block, chunks[2]);
     frame.render_widget(&ta, inner);
@@ -2101,7 +2198,7 @@ fn draw_edit_bio(frame: &mut Frame, area: Rect, input: &str, error: Option<&str>
         lines.insert(3, Line::from(Span::styled(format!("  {e}"), style_err())));
     }
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(SURFACE).fg(TEXT)),
+        Paragraph::new(lines).style(Style::default().bg(SURFACE()).fg(TEXT())),
         popup,
     );
 }
@@ -2146,7 +2243,7 @@ fn draw_block_user(
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .style(Style::default().bg(SURFACE).fg(TEXT)),
+            .style(Style::default().bg(SURFACE()).fg(TEXT())),
         popup,
     );
 }
@@ -2173,7 +2270,7 @@ fn draw_confirm_delete(frame: &mut Frame, area: Rect, preview: &str) {
         ]),
     ];
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(SURFACE).fg(TEXT)),
+        Paragraph::new(lines).style(Style::default().bg(SURFACE()).fg(TEXT())),
         popup,
     );
 }
@@ -2199,7 +2296,7 @@ fn draw_reminder(frame: &mut Frame, area: Rect, message: &str) {
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .style(Style::default().bg(SURFACE).fg(TEXT)),
+            .style(Style::default().bg(SURFACE()).fg(TEXT())),
         popup,
     );
 }

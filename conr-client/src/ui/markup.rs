@@ -58,6 +58,12 @@ pub enum ColorName {
     Muted,
 }
 
+/// Canonical color names offered by autocomplete (aliases still parse).
+pub const COLOR_NAMES: &[&str] = &[
+    "red", "green", "blue", "yellow", "orange", "pink", "purple", "cyan", "white", "gray",
+    "muted",
+];
+
 impl ColorName {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
@@ -90,6 +96,62 @@ impl ColorName {
             Self::Gray | Self::Muted => C_GRAY,
         }
     }
+}
+
+/// Filter autocomplete candidates for a typed color prefix (case-insensitive).
+pub fn filter_colors(prefix: &str) -> Vec<&'static str> {
+    let p = prefix.to_ascii_lowercase();
+    COLOR_NAMES
+        .iter()
+        .copied()
+        .filter(|n| n.starts_with(&p))
+        .collect()
+}
+
+/// Active `{partial` color tag open at the cursor (same line only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColorQuery {
+    /// Text between `{` and the cursor (may be empty).
+    pub prefix: String,
+    /// Character offset of the opening `{` in the full content string.
+    pub brace_char: usize,
+    /// Character offset of the cursor in the full content string.
+    pub cursor_char: usize,
+}
+
+/// Detect an incomplete color open-tag ending at `cursor_char`.
+///
+/// Matches `{` + optional alphabetic prefix with no `}` yet, on the same line.
+pub fn color_query_at(content: &str, cursor_char: usize) -> Option<ColorQuery> {
+    let chars: Vec<char> = content.chars().collect();
+    if cursor_char > chars.len() {
+        return None;
+    }
+    let mut i = cursor_char;
+    while i > 0 {
+        i -= 1;
+        match chars[i] {
+            '\n' => return None,
+            '}' => return None,
+            '{' => {
+                // `{/` is a closer, not a color open.
+                if i + 1 < cursor_char && chars[i + 1] == '/' {
+                    return None;
+                }
+                let prefix: String = chars[i + 1..cursor_char].iter().collect();
+                if prefix.chars().all(|c| c.is_ascii_alphabetic()) {
+                    return Some(ColorQuery {
+                        prefix,
+                        brace_char: i,
+                        cursor_char,
+                    });
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -223,21 +285,325 @@ fn parse_inner(input: &str, flags: Flags) -> Vec<Segment> {
 
 /// Find unescaped two-char closer starting at `from`. Returns start index of closer.
 fn find_closer(chars: &[char], from: usize, closer: &[char; 2]) -> Option<usize> {
-    let n = chars.len();
+    find_closer_in(chars, from, chars.len(), closer)
+}
+
+fn find_closer_in(
+    chars: &[char],
+    from: usize,
+    to: usize,
+    closer: &[char; 2],
+) -> Option<usize> {
     let mut i = from;
-    while i + 1 < n {
+    while i + 1 < to {
         if chars[i] == '\\' {
             i += 2;
             continue;
         }
-        // Skip nested same-delimiter pairs so `**a **b** c**` finds the outer close
-        // only after balanced inners — simple first-match is fine for short posts.
+        // First match is fine for short posts (no nested same-delimiter balancing).
         if chars[i] == closer[0] && chars[i + 1] == closer[1] {
             return Some(i);
         }
         i += 1;
     }
     None
+}
+
+// ── In-editor style map (1:1 with source; markers kept, dimmed) ──────────────
+
+/// Per-character style for the composer. Index matches `content.chars()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CharStyle {
+    pub bold: bool,
+    pub underline: bool,
+    pub strike: bool,
+    pub color: Option<ColorName>,
+    pub accent: bool,
+    /// Syntax marker (`**`, `{red}`, …) — drawn dim so structure stays editable.
+    pub marker: bool,
+}
+
+/// Style every source character for live in-place rendering (markers stay visible).
+pub fn style_map(content: &str) -> Vec<CharStyle> {
+    let chars: Vec<char> = content.chars().collect();
+    let mut out = vec![CharStyle::default(); chars.len()];
+    paint_styles(&chars, 0, chars.len(), Flags::default(), &mut out);
+    out
+}
+
+fn flags_to_char_style(flags: Flags, marker: bool) -> CharStyle {
+    CharStyle {
+        bold: flags.bold && !marker,
+        underline: flags.underline && !marker,
+        strike: flags.strike && !marker,
+        color: if marker { None } else { flags.color },
+        accent: flags.accent && !marker,
+        marker,
+    }
+}
+
+fn paint_styles(
+    chars: &[char],
+    from: usize,
+    to: usize,
+    flags: Flags,
+    out: &mut [CharStyle],
+) {
+    let mut i = from;
+    while i < to {
+        // Escape: dim the backslash, keep the next char as content.
+        if chars[i] == '\\' && i + 1 < to {
+            let next = chars[i + 1];
+            if matches!(next, '*' | '_' | '~' | '{' | '}' | '\\' | '#' | '@') {
+                out[i] = flags_to_char_style(flags, true);
+                out[i + 1] = flags_to_char_style(flags, false);
+                i += 2;
+                continue;
+            }
+        }
+
+        if chars[i] == '*' && i + 1 < to && chars[i + 1] == '*' {
+            if let Some(end) = find_closer_in(chars, i + 2, to, &['*', '*']) {
+                out[i] = flags_to_char_style(flags, true);
+                out[i + 1] = flags_to_char_style(flags, true);
+                out[end] = flags_to_char_style(flags, true);
+                out[end + 1] = flags_to_char_style(flags, true);
+                let mut nested = flags;
+                nested.bold = true;
+                paint_styles(chars, i + 2, end, nested, out);
+                i = end + 2;
+                continue;
+            }
+        }
+
+        if chars[i] == '_' && i + 1 < to && chars[i + 1] == '_' {
+            if let Some(end) = find_closer_in(chars, i + 2, to, &['_', '_']) {
+                out[i] = flags_to_char_style(flags, true);
+                out[i + 1] = flags_to_char_style(flags, true);
+                out[end] = flags_to_char_style(flags, true);
+                out[end + 1] = flags_to_char_style(flags, true);
+                let mut nested = flags;
+                nested.underline = true;
+                paint_styles(chars, i + 2, end, nested, out);
+                i = end + 2;
+                continue;
+            }
+        }
+
+        if chars[i] == '~' && i + 1 < to && chars[i + 1] == '~' {
+            if let Some(end) = find_closer_in(chars, i + 2, to, &['~', '~']) {
+                out[i] = flags_to_char_style(flags, true);
+                out[i + 1] = flags_to_char_style(flags, true);
+                out[end] = flags_to_char_style(flags, true);
+                out[end + 1] = flags_to_char_style(flags, true);
+                let mut nested = flags;
+                nested.strike = true;
+                paint_styles(chars, i + 2, end, nested, out);
+                i = end + 2;
+                continue;
+            }
+        }
+
+        if chars[i] == '{' {
+            if let Some((color, content_start, content_end, after)) =
+                try_parse_color_block(chars, i)
+            {
+                if after <= to {
+                    for m in i..content_start {
+                        out[m] = flags_to_char_style(flags, true);
+                    }
+                    for m in content_end..after {
+                        out[m] = flags_to_char_style(flags, true);
+                    }
+                    let mut nested = flags;
+                    nested.color = Some(color);
+                    nested.accent = false;
+                    paint_styles(chars, content_start, content_end, nested, out);
+                    i = after;
+                    continue;
+                }
+            }
+        }
+
+        if (chars[i] == '@' || chars[i] == '#') && !flags.accent {
+            if let Some(end) = take_tag_or_mention(chars, i) {
+                if end < to {
+                    let mut nested = flags;
+                    nested.accent = true;
+                    for j in i..=end {
+                        out[j] = flags_to_char_style(nested, false);
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+
+        out[i] = flags_to_char_style(flags, false);
+        i += 1;
+    }
+}
+
+fn char_style_to_ratatui(
+    cs: CharStyle,
+    base_fg: Color,
+    bg: Color,
+    selected: bool,
+    cursor: bool,
+) -> Style {
+    let select_bg = Color::Rgb(0x1e, 0x1b, 0x2e);
+    let bg = if cursor {
+        C_PURPLE
+    } else if selected {
+        select_bg
+    } else {
+        bg
+    };
+    let fg = if cursor {
+        Color::Black
+    } else if cs.marker {
+        C_GRAY
+    } else if let Some(c) = cs.color {
+        c.color()
+    } else if cs.accent {
+        C_PURPLE
+    } else {
+        base_fg
+    };
+
+    let mut style = Style::default().fg(fg).bg(bg);
+    let mut mods = Modifier::empty();
+    if cs.bold {
+        mods |= Modifier::BOLD;
+    }
+    if cs.underline {
+        mods |= Modifier::UNDERLINED;
+    }
+    if cs.strike {
+        mods |= Modifier::CROSSED_OUT;
+    }
+    if !mods.is_empty() {
+        style = style.add_modifier(mods);
+    }
+    style
+}
+
+/// Soft-wrap layout: visual rows of source indices, plus a display pos per source index
+/// (and one past the end for the trailing cursor).
+struct EditorLayout {
+    rows: Vec<Vec<usize>>,
+    /// `pos[i] = (visual_row, visual_col)` for source index `i` (`i == chars.len()` is EOL).
+    pos: Vec<(usize, usize)>,
+}
+
+fn layout_editor(chars: &[char], width: usize) -> EditorLayout {
+    let width = width.max(1);
+    let mut rows: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut pos = vec![(0usize, 0usize); chars.len() + 1];
+    let mut row = 0usize;
+    let mut col = 0usize;
+
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch == '\n' {
+            // Cursor sitting on the newline draws at the end of the current visual line.
+            pos[i] = (row, col);
+            rows.push(Vec::new());
+            row += 1;
+            col = 0;
+            continue;
+        }
+        if col >= width {
+            rows.push(Vec::new());
+            row += 1;
+            col = 0;
+        }
+        pos[i] = (row, col);
+        rows[row].push(i);
+        col += 1;
+    }
+    pos[chars.len()] = (row, col);
+    EditorLayout { rows, pos }
+}
+
+/// Render the composer buffer in-place: styled markup, dim markers, cursor, selection.
+///
+/// Every source character is shown (markers dimmed) so the caret matches editing 1:1.
+pub fn editor_lines(
+    content: &str,
+    width: usize,
+    base_fg: Color,
+    bg: Color,
+    cursor_char: usize,
+    selection: Option<(usize, usize)>,
+) -> Vec<Line<'static>> {
+    if content.is_empty() {
+        return vec![Line::from(vec![
+            Span::styled("█", Style::default().fg(Color::Black).bg(C_PURPLE)),
+            Span::styled(" type here…", Style::default().fg(C_GRAY).bg(bg)),
+        ])];
+    }
+
+    let chars: Vec<char> = content.chars().collect();
+    let styles = style_map(content);
+    let layout = layout_editor(&chars, width);
+    let cursor_char = cursor_char.min(chars.len());
+    let (cur_row, cur_col) = layout.pos[cursor_char];
+    let cursor_on_char = cursor_char < chars.len() && chars[cursor_char] != '\n';
+    let sel = selection.unwrap_or((usize::MAX, usize::MAX));
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(layout.rows.len());
+
+    for (r, row) in layout.rows.iter().enumerate() {
+        let mut spans: Vec<Span> = Vec::new();
+        let mut run = String::new();
+        let mut run_style: Option<Style> = None;
+
+        let flush_run =
+            |run: &mut String, run_style: &mut Option<Style>, spans: &mut Vec<Span>| {
+                if run.is_empty() {
+                    return;
+                }
+                let st = run_style.take().unwrap_or_default();
+                spans.push(Span::styled(std::mem::take(run), st));
+            };
+
+        for (c, &idx) in row.iter().enumerate() {
+            let selected = idx >= sel.0 && idx < sel.1;
+            let is_cursor = cursor_on_char && r == cur_row && c == cur_col;
+            let st = char_style_to_ratatui(
+                styles.get(idx).copied().unwrap_or_default(),
+                base_fg,
+                bg,
+                selected,
+                is_cursor,
+            );
+            let ch = chars[idx];
+            if run_style == Some(st) {
+                run.push(ch);
+            } else {
+                flush_run(&mut run, &mut run_style, &mut spans);
+                run.push(ch);
+                run_style = Some(st);
+            }
+        }
+        flush_run(&mut run, &mut run_style, &mut spans);
+
+        // Block cursor when the caret is past the last glyph on this visual row
+        // (end of text, after soft-wrap, or on a newline).
+        if !cursor_on_char && r == cur_row && cur_col == row.len() {
+            spans.push(Span::styled(
+                "█",
+                Style::default().fg(Color::Black).bg(C_PURPLE),
+            ));
+        }
+
+        if spans.is_empty() {
+            spans.push(Span::styled(" ", Style::default().fg(base_fg).bg(bg)));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines
 }
 
 /// `{red}inner{/}` or `{red}inner{/red}` → (color, content_start, content_end, after_idx)
@@ -625,6 +991,24 @@ mod tests {
     #[test]
     fn strip_removes_markers() {
         assert_eq!(strip_markup("**hi** {red}x{/}"), "hi x");
+    }
+
+    #[test]
+    fn color_query_prefix() {
+        let q = color_query_at("hi {re", 6).expect("open tag");
+        assert_eq!(q.prefix, "re");
+        assert_eq!(q.brace_char, 3);
+        assert!(color_query_at("hi {red}x", 9).is_none());
+        assert_eq!(filter_colors("re"), vec!["red"]);
+    }
+
+    #[test]
+    fn style_map_bold_dims_markers() {
+        let s = style_map("**hi**");
+        assert!(s[0].marker && s[1].marker);
+        assert!(s[2].bold && !s[2].marker); // h
+        assert!(s[3].bold && !s[3].marker); // i
+        assert!(s[4].marker && s[5].marker);
     }
 
     #[test]
