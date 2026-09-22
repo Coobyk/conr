@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export DATABASE_URL="${DATABASE_URL:-postgres://localhost/conr}"
+export DATABASE_URL="${DATABASE_URL:-postgres://${USER:-postgres}@localhost/conr}"
 export CONR_PORT="${CONR_PORT:-18084}"
 BASE="http://127.0.0.1:${CONR_PORT}"
 
 fuser -k "${CONR_PORT}/tcp" 2>/dev/null || true
-cargo build -p conr-server -q
-cargo run -p conr-server >/tmp/conr-phasec.log 2>&1 &
+cargo build -q
+cargo run -q -- server run >/tmp/conr-phasec.log 2>&1 &
 SPID=$!
 trap 'kill $SPID 2>/dev/null || true' EXIT
 

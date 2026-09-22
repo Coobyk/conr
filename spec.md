@@ -268,43 +268,42 @@ None. No admin token reset in v1. If they lose token + backup + passphrase, acco
 
 ---
 
-## 6. Architecture (Monorepo)
+## 6. Architecture (one crate)
 
 ```
 conr/
   Cargo.toml
-  conr-shared/
-    src/
-      lib.rs
+  migrations/
+  src/
+    main.rs           # CLI: conr client | server | agent commands
+    lib.rs
+    shared/
+      mod.rs
       models.rs
       events.rs
-      auth.rs          # alphabet, hash helpers, validation
-  conr-server/
-    src/
-      main.rs
-      router.rs
+      auth.rs         # alphabet, hash helpers, validation
+    server/
+      mod.rs          # router + run()
       handlers/
         auth.rs
         posts.rs
-        likes.rs       # when likes ship
+        media.rs
+        dms.rs
+        social.rs
+        search.rs
+        notifications.rs
         ws.rs
-      db/
-        migrations/
+      db.rs
       state.rs
-  conr-client/
-    src/
-      main.rs
+      auth.rs         # JWT / AuthUser
+      error.rs
+      ratelimit.rs
+    client/
+      mod.rs          # TUI + agent entrypoints
       app.rs
+      cli.rs
+      api.rs
       ui/
-        layout.rs
-        feed.rs
-        composer.rs
-        register.rs    # token block, welcome, unlock
-        status_bar.rs
-        # thread.rs later
-      net/
-        ws_client.rs
-        api.rs
       config.rs
       keychain.rs
       backup.rs
@@ -378,15 +377,16 @@ Minimum 80×24.
 server_url = "https://conr.example.com"  # or http://127.0.0.1:8080 for local
 
 [theme]
-background = "#0a0a0f"
-foreground = "#f0eef6"
-accent     = "#a78bfa"
-error      = "#f87171"
-success    = "#34d399"
-dim        = "#8a869a"
+background = "#10190f"
+foreground = "#decab2"
+accent     = "#98b1cd"
+error      = "#b7aa87"
+success    = "#acc7a9"
+dim        = "#616560"
+follow_system = true
 ```
 
-The client applies these six hex values to TUI chrome on launch and derives surfaces / selection from them. The previous Tomorrow Night defaults were never applied; existing files with those exact values are rewritten to the ink palette.
+The client applies these six hex values to TUI chrome on launch and derives surfaces / selection from them. When `follow_system` is true (default) and Omarchy is present, `~/.local/state/omarchy/current/theme/colors.toml` is read on each launch and overrides the hex values (accent ← `accent`/`blue`, error ← `red`, success ← `green`, dim ← `muted`). Set `follow_system = false` to pin a custom palette. The previous Tomorrow Night defaults were never applied; existing files with those exact values are rewritten.
 
 ---
 
@@ -422,7 +422,8 @@ The client applies these six hex values to TUI chrome on launch and derives surf
 - DMs (1:1 conversations)
 - Profile + bio
 - Simple post rate limit (60/hour)
-- No binary images (URLs in text are fine); no analytics
+- Images: `POST /media` + attach `image_ids` on create (max 4, 20 MiB, jpeg/png/webp/gif)
+- no analytics
 
 ### Phase D — In progress (product completeness)
 
@@ -466,6 +467,8 @@ The client applies these six hex values to TUI chrome on launch and derives surf
 | POST | `/notifications/read` | mark all read |
 | GET/POST | `/dms` | list / start DM by handle |
 | GET/POST | `/dms/:id` | thread / send |
+| POST | `/media` | multipart image upload (`file` field) → `MediaInfo` |
+| GET | `/media/:id` | download image bytes (auth; respects blocks) |
 | GET | `/ws` | auth’d; `NewPost`, `PostDeleted`, `PostEdited`, `LikeUpdated`, `Notification`, `DmMessage`, `Pong`, `Error` |
 
 ---
@@ -493,13 +496,14 @@ Internet → Caddy or nginx (HTTPS, Let's Encrypt free cert)
 | `CONR_SIGNING_KEY` | base64 of 32 bytes; HMAC-SHA256 secret for access JWTs | required in production; ephemeral in dev |
 | `CONR_PORT` | listen port | `8080` |
 | `CONR_MAX_CONNECTIONS` | WS cap | `1000` |
+| `CONR_MEDIA_DIR` | uploaded image storage | `~/.local/share/conr-server/media` |
 
 ```bash
 createdb conr
 export DATABASE_URL=postgres://localhost/conr
 export CONR_SIGNING_KEY=...
-cargo run -p conr-server
-cargo run -p conr-client
+cargo run -- server run
+cargo run -- client
 ```
 
 ---
@@ -512,7 +516,7 @@ cargo run -p conr-client
 | **B** (done) | Likes, multi-level replies, tombstone delete |
 | **C** (done) | Follows, search, tags, blocks, notifs, DMs, edit, profile |
 | **D** | Pagination, theme, unread DMs, markup/cache polish, spec sync |
-| later | Binary media, spam tooling, rate-limit register/login, CI |
+| later | Spam tooling, rate-limit register/login, CI |
 
 ---
 
@@ -538,11 +542,8 @@ cargo run -p conr-client
 
 ## Appendix B: Dependencies (indicative)
 
-**conr-shared:** serde, serde_json, ring, blake3, xid  
-
-**conr-server:** axum, tokio, sqlx, jsonwebtoken, tower-http, tracing  
-
-**conr-client:** ratatui, crossterm, tokio, tokio-tungstenite, reqwest, keyring, rusqlite, tui-textarea, toml, dirs, argon2, chacha20poly1305 (or equivalent AEAD)
+**conr:** single crate — shared models + axum server + ratatui client + CLI  
+Deps: serde, serde_json, blake3, xid, axum, tokio, sqlx, jsonwebtoken, tower-http, ratatui, crossterm, reqwest, keyring, rusqlite, tokio-tungstenite, toml, dirs, argon2, chacha20poly1305 (or equivalent AEAD), clap
 
 ---
 

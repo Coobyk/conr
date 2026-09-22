@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 PORT="${CONR_PORT:-8080}"
-DATABASE_URL="${DATABASE_URL:-postgres://localhost/conr}"
+DATABASE_URL="${DATABASE_URL:-postgres://${USER:-postgres}@localhost/conr}"
 MODE="quick"
 TUNNEL_NAME="conr"
 HOSTNAME=""
@@ -55,9 +55,9 @@ export CONR_PORT="$PORT"
 
 # Start server if nothing is listening on the port.
 if ! curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
-  echo "starting conr-server on :${PORT} …"
-  cargo build -p conr-server -q
-  cargo run -p conr-server -q >/tmp/conr-server-tunnel.log 2>&1 &
+  echo "starting conr server on :${PORT} …"
+  cargo build -q
+  cargo run -q -- server run >/tmp/conr-server-tunnel.log 2>&1 &
   echo $! >/tmp/conr-server-tunnel.pid
   for _ in $(seq 1 60); do
     if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then

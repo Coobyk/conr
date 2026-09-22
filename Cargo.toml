@@ -1,28 +1,59 @@
-[workspace]
-resolver = "2"
-members = [
-    "conr-shared",
-    "conr-server",
-    "conr-client",
-]
-
-[workspace.package]
+[package]
+name = "conr"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/coobyk/conr"
+description = "conr — terminal social network (client + server in one binary)"
 
-[workspace.dependencies]
-conr-shared = { path = "conr-shared" }
+[[bin]]
+name = "conr"
+path = "src/main.rs"
+
+[lib]
+name = "conr"
+path = "src/lib.rs"
+
+[dependencies]
+# shared
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
 xid = "1"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
-tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-anyhow = "1"
-base64 = "0.22"
 rand = "0.8"
 hex = "0.4"
+base64 = "0.23"
+
+# core
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "7"
+
+# server
+axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "limit"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono", "migrate"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+tower = "0.5"
+futures-util = "0.3"
+
+# client
+toml = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "multipart"] }
+ratatui = "0.29"
+crossterm = "0.28"
+tui-textarea = "0.7"
+keyring = "4"
+# rusqlite 0.39 keeps libsqlite3-sys <0.38 (sqlx 0.9 sqlite requirement)
+rusqlite = { version = "0.39", features = ["bundled"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+url = "2"
+argon2 = "0.6"
+chacha20poly1305 = "0.11"
+zeroize = { version = "1", features = ["derive"] }
+nucleo-matcher = "0.3"

@@ -13,7 +13,9 @@ import urllib.request
 
 PORT = os.environ.get("CONR_PORT", "18085")
 BASE = f"http://127.0.0.1:{PORT}"
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgres://localhost/conr")
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL", f"postgres://{os.environ.get('USER', 'postgres')}@localhost/conr"
+)
 
 
 def req(method: str, path: str, token: str | None = None, body: dict | None = None):
@@ -43,10 +45,10 @@ def main() -> None:
     env["CONR_PORT"] = PORT
 
     subprocess.run(["fuser", "-k", f"{PORT}/tcp"], check=False, capture_output=True)
-    subprocess.run(["cargo", "build", "-p", "conr-server", "-q"], check=True)
+    subprocess.run(["cargo", "build", "-q"], check=True)
     log = open("/tmp/conr-phasec.log", "w")
     proc = subprocess.Popen(
-        ["cargo", "run", "-p", "conr-server", "-q"],
+        ["cargo", "run", "-q", "--", "server", "run"],
         env=env,
         stdout=log,
         stderr=subprocess.STDOUT,
